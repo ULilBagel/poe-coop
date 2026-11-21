@@ -1,0 +1,15 @@
+# Obsidian's code: never commit
+decompiled/
+
+# Local game instances, saves, logs, probes and test output
+.dev/
+
+# Downloaded build/runtime dependencies (see tools/README.md)
+tools/*
+!tools/README.md
+
+# Build and release output
+bin/
+obj/
+dist/
+*.user
