@@ -15,8 +15,6 @@ Options:
   --game-dir DIR          Pillars of Eternity installation directory
   --platform windows|linux
                           Override automatic game binary detection
-  --proton-prefix DIR     Proton prefix (the directory containing user.reg)
-  --skip-proton-config    Do not configure winhttp (for non-Proton Windows)
   -h, --help              Show this help
 
 Usually no options are needed when Steam is installed in a standard location.
@@ -51,8 +49,6 @@ find_game_dir() {
 }
 
 platform=auto
-proton_prefix=
-skip_proton_config=0
 game_dir=
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -65,15 +61,6 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || fail "--platform needs windows or linux"
             platform=$2
             shift 2
-            ;;
-        --proton-prefix)
-            [ "$#" -ge 2 ] || fail "--proton-prefix needs a directory"
-            proton_prefix=$2
-            shift 2
-            ;;
-        --skip-proton-config)
-            skip_proton_config=1
-            shift
             ;;
         -h|--help)
             usage
@@ -145,40 +132,9 @@ else
 fi
 [ -f "$plugin_dll" ] || fail "missing plugin/PoECoop.dll; build a release package first"
 
-for command_name in unzip awk cmp mktemp; do
+for command_name in unzip cmp mktemp; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
 done
-
-proton_reg=
-if [ "$platform" = windows ] && [ "$skip_proton_config" -eq 0 ]; then
-    if [ -z "$proton_prefix" ]; then
-        case "$game_dir" in
-            */steamapps/common/*)
-                steamapps_dir=${game_dir%/common/*}
-                candidate="$steamapps_dir/compatdata/$STEAM_APP_ID/pfx"
-                [ ! -f "$candidate/user.reg" ] || proton_prefix=$candidate
-                ;;
-        esac
-    fi
-    if [ -z "$proton_prefix" ]; then
-        for steam_root in \
-            "$HOME/.local/share/Steam" \
-            "$HOME/.steam/steam" \
-            "$HOME/.steam/root" \
-            "$HOME/snap/steam/common/.local/share/Steam" \
-            "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
-        do
-            candidate="$steam_root/steamapps/compatdata/$STEAM_APP_ID/pfx"
-            if [ -f "$candidate/user.reg" ]; then
-                proton_prefix=$candidate
-                break
-            fi
-        done
-    fi
-    [ -n "$proton_prefix" ] || fail "Proton prefix not found; launch the game once, or pass --proton-prefix DIR"
-    proton_reg="$proton_prefix/user.reg"
-    [ -f "$proton_reg" ] || fail "Proton registry not found: $proton_reg"
-fi
 
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/poecoop-install.XXXXXX")
 trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
@@ -218,49 +174,6 @@ install_file() {
     echo "Installed $relative"
 }
 
-configure_proton() {
-    registry=$1
-    updated="$temp_dir/user.reg"
-    awk '
-        /^\[Software\\\\Wine\\\\DllOverrides\]/ {
-            in_overrides = 1
-            found_section = 1
-            print
-            next
-        }
-        /^\[/ {
-            if (in_overrides && !written) {
-                print "\"winhttp\"=\"native,builtin\""
-                written = 1
-            }
-            in_overrides = 0
-        }
-        {
-            if (in_overrides && tolower($0) ~ /^"winhttp"[[:space:]]*=/) {
-                if (!written) print "\"winhttp\"=\"native,builtin\""
-                written = 1
-                next
-            }
-            print
-        }
-        END {
-            if (in_overrides && !written) print "\"winhttp\"=\"native,builtin\""
-            if (!found_section) {
-                print ""
-                print "[Software\\\\Wine\\\\DllOverrides]"
-                print "\"winhttp\"=\"native,builtin\""
-            }
-        }
-    ' "$registry" > "$updated"
-    if cmp -s "$registry" "$updated"; then
-        return 0
-    fi
-    backup_file "proton/user.reg" "$registry"
-    chmod --reference="$registry" "$updated"
-    mv "$updated" "$registry"
-    echo "Configured Proton to load BepInEx's winhttp.dll (no Steam launch options needed)."
-}
-
 # doorstop_config.ini is user configuration: retain it on upgrades.
 find "$extract_dir" -type f > "$temp_dir/bepinex-files"
 while IFS= read -r source_file; do
@@ -276,8 +189,6 @@ done < "$temp_dir/bepinex-files"
 
 if [ "$platform" = linux ]; then
     chmod +x "$game_dir/run_bepinex.sh"
-else
-    configure_proton "$proton_reg"
 fi
 
 install_file "BepInEx/plugins/PoECoop/PoECoop.dll" "$plugin_dll"
@@ -299,7 +210,9 @@ if [ -n "$backup_dir" ]; then
     echo "Replaced files were backed up in: $backup_dir"
 fi
 if [ "$platform" = windows ]; then
-    echo "Launch Pillars of Eternity normally from Steam. No launch options are needed."
+    echo "For Proton, add this Steam launch option before playing:"
+    echo 'WINEDLLOVERRIDES="winhttp=n,b" %command%'
+    echo "For Steam mode, append -steam to that launch option."
 else
     if [ -f "$package_root/launch-poecoop.sh" ]; then
         launcher="$package_root/launch-poecoop.sh"

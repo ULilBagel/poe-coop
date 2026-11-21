@@ -149,13 +149,11 @@ acceptance before milestone 8 can be called fully verified.
    `install-poecoop.sh` on Linux/Proton or `install-poecoop.bat` on Windows.
    The installers detect standard Steam locations, preserve saves, BepInEx
    configuration and unrelated plugins, back up replaced files, and are safe to
-   rerun. On Proton they configure BepInEx's `winhttp` override in the existing
-   prefix; no Wine configuration tool or manual DLL override is needed.
-3. **Direct IP** needs no Steam launch options on Proton or Windows: launch
-   normally from Steam, or use `./launch-poecoop.sh`. **Steam mode** requires
-   `-steam`, either through `./launch-poecoop.sh -steam` or the platform's Steam
-   launch options. Native Linux launching through Steam also needs the BepInEx
-   wrapper documented in `INSTALL.md`.
+   rerun. The installers do not edit Proton's `user.reg` or Steam settings.
+3. For Proton, add `WINEDLLOVERRIDES="winhttp=n,b" %command%` to the game's Steam
+   launch options. **Steam mode** additionally requires `-steam`, either through
+   `./launch-poecoop.sh -steam` or appended to that option. Native Linux launching
+   through Steam also needs the BepInEx wrapper documented in `INSTALL.md`.
 4. To build a release, install a .NET SDK (8 or newer) and `zip`, then run
    `./scripts/build-release.sh`. This creates `dist/PoECoop-VERSION.zip` and its
    SHA-256 file without deploying into the real game.

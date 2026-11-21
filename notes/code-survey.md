@@ -698,15 +698,15 @@ host/guest smoke test. No real two-account Steam co-op session has been accepted
   player installation path. They detect standard Steam locations, preserve
   saves, BepInEx configuration and unrelated plugins, back up files they replace
   under `.poecoop-backups`, and leave unchanged files alone on rerun. The Proton
-  installer configures `"winhttp"="native,builtin"` in the existing prefix and
-  backs up its registry file; no separate Wine configuration tool or manual DLL
-  override is required. Installer and repository-rerun evidence is under
+  installer does not edit `user.reg` or Steam settings. Instead, the user adds
+  `WINEDLLOVERRIDES="winhttp=n,b" %command%` explicitly to the game's Steam
+  launch options. Installer and repository-rerun evidence is under
   `.dev/test-proton/logs/`.
-- **Direct IP is the default and needs no Steam launch options on Proton or
-  Windows.** Start normally from Steam or run `./launch-poecoop.sh`. **Steam
-  mode requires `-steam`**, supplied through `./launch-poecoop.sh -steam` or the
-  platform's Steam launch options. Native Linux still uses the BepInEx wrapper
-  when launched through Steam; `INSTALL.md` gives the exact per-platform forms.
+- **Direct IP is the default.** For Proton, add the visible `WINEDLLOVERRIDES`
+  option before launching. **Steam mode additionally requires `-steam`**, supplied
+  through `./launch-poecoop.sh -steam` or appended to that option. Native Linux
+  still uses the BepInEx wrapper when launched through Steam; `INSTALL.md` gives
+  the exact per-platform forms.
 
 ### Proton Experimental and Direct IP validation
 

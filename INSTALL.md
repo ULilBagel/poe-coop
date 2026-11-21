@@ -6,7 +6,7 @@ The installer preserves saves, BepInEx configuration, and unrelated plugins. It 
 
 ## Windows through Proton on Linux (recommended)
 
-Direct IP needs no Steam launch options, Wine configuration tools, or manual DLL overrides.
+Proton requires one explicit Steam launch option so Wine loads BepInEx's `winhttp.dll`. The installer does not edit Proton's `user.reg` or any other registry file.
 
 1. In Steam, install **Pillars of Eternity**. Under **Properties → Compatibility**, select **Proton Experimental**. Launch the game once and close it so Steam creates its Proton prefix.
 2. Extract the PoE Co-op release zip. Open a terminal in the extracted `PoECoop` folder and run:
@@ -21,19 +21,27 @@ Direct IP needs no Steam launch options, Wine configuration tools, or manual DLL
    ./install-poecoop.sh "/path/to/steamapps/common/Pillars of Eternity"
    ```
 
-3. For **Direct IP** (the default), start the game with Steam's normal **Play** button, or run `./launch-poecoop.sh` with no options. For **Steam mode**, run `./launch-poecoop.sh -steam` instead. The launcher uses Steam on `PATH`, or `flatpak run com.valvesoftware.Steam` when Steam is installed through Flatpak. Do not add `WINEDLLOVERRIDES`, `run_bepinex.sh`, or other launch options. Remove old BepInEx launch options if you previously used them.
+3. In Steam, open **Properties → General → Launch Options** and add:
 
-The installer unpacks the official Windows x64 BepInEx 5.4.23.6 package and sets `"winhttp"="native,builtin"` in the existing Proton prefix's `user.reg`. It backs up that registry file before changing it. For a nonstandard prefix location, use:
+   ```text
+   WINEDLLOVERRIDES="winhttp=n,b" %command%
+   ```
 
-```sh
-./install-poecoop.sh --proton-prefix "/path/to/steamapps/compatdata/291650/pfx"
-```
+   For **Steam mode**, use this instead:
+
+   ```text
+   WINEDLLOVERRIDES="winhttp=n,b" %command% -steam
+   ```
+
+   You can also launch through `./launch-poecoop.sh`, or `./launch-poecoop.sh -steam` for Steam mode. The launcher supplies the same visible Wine override and uses Steam on `PATH`, or `flatpak run com.valvesoftware.Steam` when Steam is installed through Flatpak.
+
+The installer only unpacks the official Windows x64 BepInEx 5.4.23.6 package and `PoECoop.dll` into the game folder. It does not edit `user.reg`, Steam settings, or launch options.
 
 ## Native Windows
 
 1. Extract the release zip.
 2. Double-click `install-poecoop.bat`. Standard Steam locations are detected automatically; otherwise enter the game folder when prompted. You can also drag the game folder onto the batch file.
-3. For Direct IP, launch the game normally from Steam or its desktop shortcut. No launch options are needed; for Steam mode, add `-steam` as described below.
+3. For Direct IP, launch the game normally from Steam or its desktop shortcut. For Steam mode, add `-steam` as described below. Windows does not need the Proton `WINEDLLOVERRIDES` option.
 
 ## Native Linux
 
@@ -73,7 +81,7 @@ On a LAN, use the host's LAN address. Over the internet, the host normally needs
 
 ## Optional Steam mode
 
-Steam mode uses Steam lobbies and peer-to-peer networking, so no IP address or port forwarding is needed. It requires the `-steam` game argument; Direct IP needs no game arguments or launch options.
+Steam mode uses Steam lobbies and peer-to-peer networking, so no IP address or port forwarding is needed. It requires the `-steam` game argument; Direct IP does not require that argument. Proton still requires the `WINEDLLOVERRIDES` launch option shown above for both modes.
 
 - **Proton:** launch with `./launch-poecoop.sh -steam`.
 - **Native Linux:** launch with `./launch-poecoop.sh -steam`, or use `./run_bepinex.sh %command% -steam` as the Steam launch option.
@@ -88,7 +96,7 @@ Steam mode uses Steam lobbies and peer-to-peer networking, so no IP address or p
 
 Extract the new release and run its installer again. Existing `BepInEx/config`, saves, and unrelated plugins are retained; only replaced files receive a new timestamped backup.
 
-To confirm the mod loaded, open `BepInEx/LogOutput.log` in the game folder and look for `PoE Co-op`. If the Proton installer cannot find the prefix, launch the game once through Steam and retry, or pass `--proton-prefix` as shown above. Run `./install-poecoop.sh --help` for all installer options.
+To confirm the mod loaded, open `BepInEx/LogOutput.log` in the game folder and look for `PoE Co-op`. If Proton cannot find the game, pass its directory as the first argument to `./install-poecoop.sh`. Run `./install-poecoop.sh --help` for all installer options.
 
 ## Building a release
 

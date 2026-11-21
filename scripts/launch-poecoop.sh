@@ -8,7 +8,7 @@ usage() {
     cat <<'EOF'
 Usage: launch-poecoop.sh [GAME_DIR] [--platform windows|linux] [game arguments]
 
-Direct IP is the default and needs no options. Pass -steam to enable Steam mode.
+Direct IP is the default. Proton uses WINEDLLOVERRIDES="winhttp=n,b"; pass -steam to enable Steam mode.
 Native Linux: starts the game through BepInEx directly and forwards game arguments.
 Windows/Proton: asks Steam to launch the installed game; only -steam is accepted.
 
@@ -105,6 +105,7 @@ if [ "$platform" = windows ]; then
     if [ "$#" -gt 0 ] && { [ "$#" -ne 1 ] || [ "$1" != -steam ]; }; then
         fail "Windows/Proton accepts only the optional -steam argument"
     fi
+    export WINEDLLOVERRIDES="winhttp=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
     echo "Opening $GAME_NAME through Steam..."
     if command -v steam >/dev/null 2>&1; then
         exec steam -applaunch "$STEAM_APP_ID" "$@"
