@@ -68,12 +68,12 @@ GUIDs for saves. Use those as network ids; spawned objects (summons, projectiles
 get host-assigned ids.
 
 **Transport.** One interface, two implementations:
-- Direct TCP by IP address. This is the default and needs no co-op launch
-  options. It also supports development with two game instances on one PC.
-- Steam networking through the bundled Steamworks.NET, implemented in plugin
-  0.9.0 for play without IP typing or port forwarding. Steam mode is selected
+- Steam networking through the bundled Steamworks.NET is the default in plugin
+  0.9.0, for play without IP typing or port forwarding. Steam mode is selected
   with `-steam` through `scripts/launch-poecoop.sh` or the platform's Steam
   launch options. Real two-account P2P/NAT/relay acceptance is still pending.
+- Direct TCP by IP address is the explicit development/fallback option and also
+  supports two game instances on one PC.
 
 **Joining.** Once the host is out of combat, it sends its save file to the guest;
 the guest loads it, then switches to mirror mode. A guest connecting during

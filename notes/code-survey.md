@@ -702,11 +702,12 @@ host/guest smoke test. No real two-account Steam co-op session has been accepted
   `WINEDLLOVERRIDES="winhttp=n,b" %command%` explicitly to the game's Steam
   launch options. Installer and repository-rerun evidence is under
   `.dev/test-proton/logs/`.
-- **Direct IP is the default.** For Proton, add the visible `WINEDLLOVERRIDES`
-  option before launching. **Steam mode additionally requires `-steam`**, supplied
-  through `./launch-poecoop.sh -steam` or appended to that option. Native Linux
-  still uses the BepInEx wrapper when launched through Steam; `INSTALL.md` gives
-  the exact per-platform forms.
+- **Steam is the default; Direct IP is the explicit fallback.** For Proton, add
+  the visible `WINEDLLOVERRIDES` option before launching. **Steam mode requires
+  `-steam`**, supplied through `./launch-poecoop.sh -steam` or appended to that
+  option. Native Linux still uses the BepInEx wrapper when launched through
+  Steam; `INSTALL.md` gives the exact per-platform forms. The installer and
+  launcher do not edit `user.reg`, Steam settings, or rich presence.
 
 ### Proton Experimental and Direct IP validation
 

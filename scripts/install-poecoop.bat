@@ -107,9 +107,9 @@ try {
         Set-Content -LiteralPath $config -Encoding ASCII -Value @(
             '## PoE Co-op defaults. Existing settings are never replaced by the installer.',
             '[Connection]',
-            'PreferredTransport = DirectIP'
+            'PreferredTransport = Steam'
         )
-        Write-Host 'Installed Direct IP default configuration'
+        Write-Host 'Installed Steam default configuration'
     }
     if ($script:backupDir) { Write-Host "Replaced files were backed up in: $script:backupDir" }
 } finally {

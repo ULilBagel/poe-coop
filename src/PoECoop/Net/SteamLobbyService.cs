@@ -83,7 +83,6 @@ namespace PoECoop.Net
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly List<SteamFriendInfo> _friends = new List<SteamFriendInfo>();
         private readonly ReadOnlyCollection<SteamFriendInfo> _readOnlyFriends;
-        private readonly List<string> _presenceKeys = new List<string>();
 
         private readonly object _availabilityLock = new object();
         private Type _steamManagerType;
@@ -580,7 +579,6 @@ namespace PoECoop.Net
                     return;
                 }
                 LobbyOwner = owner;
-                SetHostPresence(lobby);
                 _configuringLobby = false;
                 CompleteSession(generation, true, owner);
             }
@@ -616,7 +614,6 @@ namespace PoECoop.Net
                 LobbyOwner = owner;
                 Visibility = visibility;
                 CurrentNonce = nonce;
-                SetOwnedPresence("status", "Playing Pillars of Eternity co-op");
                 _configuringLobby = false;
                 CompleteSession(generation, false, owner);
             }
@@ -864,42 +861,6 @@ namespace PoECoop.Net
             return tokens;
         }
 
-        private void SetHostPresence(CSteamID lobby)
-        {
-            SetOwnedPresence("status", Visibility == SteamLobbyVisibility.Private
-                ? "Hosting a private Pillars of Eternity co-op game"
-                : "Hosting a Pillars of Eternity co-op game");
-            if (Visibility != SteamLobbyVisibility.FriendsOnly) return;
-            SetOwnedPresence("connect", "+connect_lobby " + LobbyIdText(lobby));
-            SetOwnedPresence("steam_player_group", LobbyIdText(lobby));
-            SetOwnedPresence("steam_player_group_size", MaxLobbyMembers.ToString(CultureInfo.InvariantCulture));
-        }
-
-        private void SetOwnedPresence(string key, string value)
-        {
-            try
-            {
-                if (SteamFriends.SetRichPresence(key, value) && !_presenceKeys.Contains(key)) _presenceKeys.Add(key);
-                else if (!_presenceKeys.Contains(key)) Log("Steam refused rich presence key " + key);
-            }
-            catch (Exception ex) { Log("Steam rich presence failed for " + key + ": " + ex); }
-        }
-
-        private void ClearOwnedPresence()
-        {
-            if (!IsAvailable)
-            {
-                _presenceKeys.Clear();
-                return;
-            }
-            foreach (string key in _presenceKeys)
-            {
-                try { SteamFriends.SetRichPresence(key, null); }
-                catch (Exception ex) { Log("Steam rich presence cleanup failed for " + key + ": " + ex); }
-            }
-            _presenceKeys.Clear();
-        }
-
         private void Terminate(string message, bool leaveSteam, bool notifyStop)
         {
             ++_generation;
@@ -917,8 +878,6 @@ namespace PoECoop.Net
             CurrentNonce = null;
             _pendingNonce = null;
 
-            if (IsAvailable) ClearOwnedPresence();
-            else _presenceKeys.Clear();
             if (leaveSteam && IsAvailable && lobby != CSteamID.Nil)
             {
                 try { SteamMatchmaking.LeaveLobby(lobby); }

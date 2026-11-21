@@ -27,7 +27,7 @@ Proton requires one explicit Steam launch option so Wine loads BepInEx's `winhtt
    WINEDLLOVERRIDES="winhttp=n,b" %command%
    ```
 
-   For **Steam mode**, use this instead:
+   For the default **Steam mode**, use this instead:
 
    ```text
    WINEDLLOVERRIDES="winhttp=n,b" %command% -steam
@@ -41,7 +41,7 @@ The installer only unpacks the official Windows x64 BepInEx 5.4.23.6 package and
 
 1. Extract the release zip.
 2. Double-click `install-poecoop.bat`. Standard Steam locations are detected automatically; otherwise enter the game folder when prompted. You can also drag the game folder onto the batch file.
-3. For Direct IP, launch the game normally from Steam or its desktop shortcut. For Steam mode, add `-steam` as described below. Windows does not need the Proton `WINEDLLOVERRIDES` option.
+3. For the default Steam mode, add `-steam` as described below. Direct IP can be used without `-steam` and does not need the Proton `WINEDLLOVERRIDES` option.
 
 ## Native Linux
 
@@ -52,7 +52,7 @@ Run these commands from the extracted `PoECoop` folder:
 ./launch-poecoop.sh
 ```
 
-The launcher starts the native game through BepInEx. Direct IP needs no options; pass `-steam` to `./launch-poecoop.sh` only when using Steam mode.
+The launcher starts the native game through BepInEx. Steam is the default; pass `-steam` to `./launch-poecoop.sh` for that mode. Direct IP remains available without `-steam`.
 
 To launch through Steam instead, set this **native Linux only** launch option for Direct IP:
 
@@ -68,29 +68,29 @@ For Steam mode, use the same wrapper with `-steam`:
 
 If both Windows and native Linux binaries are present, pass `--platform windows` or `--platform linux` to the installer and launcher.
 
-## Play with Direct IP (default)
+## Play with Steam (default)
 
-Direct IP is selected by default on a new installation. Existing settings are not changed.
-
-1. Both players launch the game and press **F10** to open the co-op window.
-2. The host chooses **Direct IP**, enters a player name, and clicks **Host a game**. The default port is **14242**.
-3. The guest chooses **Direct IP**, enters the host's IP address and port, and clicks **Join**.
-4. The host loads a save when needed and assigns party members in the co-op window.
-
-On a LAN, use the host's LAN address. Over the internet, the host normally needs to forward **TCP port 14242** to their PC and the guest uses the host's public IP. Only the host needs to forward the port. Firewall prompts must also allow the game to accept connections.
-
-## Optional Steam mode
-
-Steam mode uses Steam lobbies and peer-to-peer networking, so no IP address or port forwarding is needed. It requires the `-steam` game argument; Direct IP does not require that argument. Proton still requires the `WINEDLLOVERRIDES` launch option shown above for both modes.
+Steam mode is selected by default on a new installation. Existing settings are not changed. It uses Steam lobbies and peer-to-peer networking, so no IP address or port forwarding is needed. It requires the `-steam` game argument; Direct IP does not require that argument. Proton still requires the `WINEDLLOVERRIDES` launch option shown above for both modes.
 
 - **Proton:** launch with `./launch-poecoop.sh -steam`.
 - **Native Linux:** launch with `./launch-poecoop.sh -steam`, or use `./run_bepinex.sh %command% -steam` as the Steam launch option.
 - **Native Windows:** add `-steam` to the game's Steam launch options.
 
 1. Both players sign in to Steam and launch the modded game with `-steam`.
-2. Press **F10** and choose **Steam**.
+2. Press **F10**. **Steam** is already selected by default.
 3. The host clicks **Host Steam lobby**, then invites a friend through the co-op window or the native Steam invite dialog.
 4. The guest accepts the invitation through Steam. The host can invite through the co-op window or the native Steam invite dialog.
+
+## Use Direct IP as a fallback
+
+Direct IP remains available for development or when Steam is unavailable.
+
+1. Both players launch the game and press **F10** to open the co-op window.
+2. Choose **Direct IP**. The host enters a player name and clicks **Host a game**. The default port is **14242**.
+3. The guest chooses **Direct IP**, enters the host's IP address and port, and clicks **Join**.
+4. The host loads a save when needed and assigns party members in the co-op window.
+
+On a LAN, use the host's LAN address. Over the internet, the host normally needs to forward **TCP port 14242** to their PC and the guest uses the host's public IP. Only the host needs to forward the port. Firewall prompts must also allow the game to accept connections.
 
 ## Updating or troubleshooting
 

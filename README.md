@@ -15,7 +15,7 @@ The mod runs on native Windows, native Linux, and the Windows game through Proto
 
 The installer preserves saves, configuration, and unrelated plugins. Replaced files are backed up under `.poecoop-backups` in the game folder. Reinstalling is safe. It does not edit `user.reg` or Steam settings.
 
-For **Steam mode**, add `-steam` to the Proton launch option, or use `./launch-poecoop.sh -steam`.
+**Steam is the default transport; Direct IP is the fallback.** For the default Steam mode, add `-steam` to the Proton launch option, or use `./launch-poecoop.sh -steam`.
 
 See [INSTALL.md](INSTALL.md) for complete installation and launch instructions.
 

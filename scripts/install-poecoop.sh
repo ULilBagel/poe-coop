@@ -199,9 +199,9 @@ if [ ! -e "$default_config" ]; then
     cat > "$default_config" <<'EOF'
 ## PoE Co-op defaults. Existing settings are never replaced by the installer.
 [Connection]
-PreferredTransport = DirectIP
+PreferredTransport = Steam
 EOF
-    echo "Installed Direct IP default configuration"
+    echo "Installed Steam default configuration"
 fi
 
 echo ""
