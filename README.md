@@ -44,4 +44,4 @@ Direct IP and Proton installation are live-tested. Steam lobby creation and tran
 
 Only mod source, installers, launcher, build scripts, and documentation belong here. The decompiled game, local save files, game instances, logs, test output, and downloaded dependency archives are intentionally excluded.
 
-Milestones and verification evidence are documented in [PLAN.md](PLAN.md) and [notes/code-survey.md](notes/code-survey.md). For a detailed bug-search handoff, see [docs/BUG-SEARCH-CONTEXT.md](docs/BUG-SEARCH-CONTEXT.md).
+Milestones and verification evidence are documented in [PLAN.md](PLAN.md) and [notes/code-survey.md](notes/code-survey.md). For a detailed bug-search handoff, see [docs/BUG-SEARCH-CONTEXT.md](docs/BUG-SEARCH-CONTEXT.md). For the proposed co-op feature catalogue and implementation roadmap, see [docs/COOP-FEATURE-ROADMAP.md](docs/COOP-FEATURE-ROADMAP.md).
