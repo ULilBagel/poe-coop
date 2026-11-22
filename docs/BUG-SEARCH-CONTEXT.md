@@ -13,7 +13,7 @@ Read these sections first:
 5. **Prioritized bug-search plan** — concrete leads and how to validate them.
 6. **Test harness and evidence** — how to prove or reject a finding.
 
-This is a living engineering document. Update it when behavior, protocol, installation, or acceptance status changes.
+This is a living engineering document. Update it when behavior, protocol, installation, or acceptance status changes. Current user-reported defects are logged separately in [docs/PLAYTEST-ISSUES.md](PLAYTEST-ISSUES.md), including ground-loot presentation, faction mismatch, and severe guest performance problems.
 
 ---
 
