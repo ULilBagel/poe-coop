@@ -101,6 +101,14 @@ try {
     }
     Install-File 'BepInEx\plugins\PoECoop\PoECoop.dll' $plugin
 
+    # The updater lives next to the game, so a later release is one double-click away.
+    foreach ($updater in @((Join-Path $root 'update-poecoop.bat'), (Join-Path $root 'scripts\update-poecoop.bat'))) {
+        if (Test-Path -LiteralPath $updater -PathType Leaf) {
+            Install-File 'update-poecoop.bat' $updater
+            break
+        }
+    }
+
     $config = Join-Path $game 'BepInEx\config\poecoop.cfg'
     if (-not (Test-Path -LiteralPath $config)) {
         New-Item -ItemType Directory -Path (Split-Path -Parent $config) -Force | Out-Null
