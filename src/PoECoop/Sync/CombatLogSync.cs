@@ -31,6 +31,7 @@ namespace PoECoop.Sync
 
         private readonly Session _session;
         private readonly List<Entry> _pending = new List<Entry>();
+        private readonly List<Console.ConsoleMessage> _incoming = new List<Console.ConsoleMessage>();
         private readonly bool _probe;
 
         private bool _hosting, _joined;
@@ -83,8 +84,9 @@ namespace PoECoop.Sync
             CombatLogSync self = s_instance;
             if (self == null || messages == null || ApplyingHostLog || !self._session.IsHost) return;
             self.SyncRole();
-            if (self._session.Players.Count < 2) return;
+            if (self._session.Players.Count < 2 || messages.Count == 0) return;
 
+            long started = PerfStats.Begin();
             for (int i = 0; i < messages.Count; i++)
             {
                 if (self._pending.Count >= MaxPendingEntries)
@@ -106,6 +108,7 @@ namespace PoECoop.Sync
                     self.ReportDrop(1, "entry contains invalid text");
                 }
             }
+            PerfStats.End("combatlog.capture", started);
         }
 
         /// <summary>Records the exact finalized batches delivered to each UI in probe runs.</summary>
@@ -148,7 +151,9 @@ namespace PoECoop.Sync
             }
             if (_pending.Count == 0 || now < _nextSend) return;
             _nextSend = now + SendInterval;
+            long started = PerfStats.Begin();
             SendBatch();
+            PerfStats.End("combatlog.update", started);
         }
 
         private void SyncRole()
@@ -224,12 +229,11 @@ namespace PoECoop.Sync
                 Color = color,
                 Text = text,
                 Verbose = verbose,
-                Children = new List<Entry>(),
                 NodeCount = 1,
                 WireSize = FixedNodeSize + StringSize(textBytes) + StringSize(verboseBytes),
             };
 
-            if (source.Children == null) { entry = result; return true; }
+            if (source.Children == null || source.Children.Count == 0) { entry = result; return true; }
             if (source.Children.Count > MaxNodes) { reason = "entry has too many children"; return false; }
             if (depth == MaxDepth && source.Children.Count > 0)
             {
@@ -247,7 +251,7 @@ namespace PoECoop.Sync
                     reason = "entry exceeds the node or batch limit";
                     return false;
                 }
-                result.Children.Add(child);
+                (result.Children ?? (result.Children = new List<Entry>(source.Children.Count))).Add(child);
             }
             entry = result;
             return true;
@@ -286,19 +290,23 @@ namespace PoECoop.Sync
             if (data.Length > MaxBatchBytes) throw new InvalidOperationException("combat log batch size " + data.Length);
             _session.SendToGuests(data);
             _pending.RemoveRange(0, count);
+            PerfStats.Count("combatlog.delta");
+            PerfStats.Count("combatlog.records", count);
         }
 
         private static void WriteNode(MessageWriter writer, Entry entry)
         {
             writer.Int((int)entry.Mode)
                 .Float(entry.Color.r).Float(entry.Color.g).Float(entry.Color.b).Float(entry.Color.a)
-                .String(entry.Text).String(entry.Verbose).Int(entry.Children.Count);
+                .String(entry.Text).String(entry.Verbose).Int(entry.Children == null ? 0 : entry.Children.Count);
+            if (entry.Children == null) return;
             for (int i = 0; i < entry.Children.Count; i++) WriteNode(writer, entry.Children[i]);
         }
 
         private void ReportDrop(int count, string reason)
         {
             _droppedEntries = _droppedEntries > int.MaxValue - count ? int.MaxValue : _droppedEntries + count;
+            PerfStats.Count("combatlog.skipped", count);
             if (_dropReason == null) _dropReason = reason;
         }
 
@@ -318,6 +326,7 @@ namespace PoECoop.Sync
             if (sender != null || reader.Type != MessageType.CombatLogs || !_session.IsGuest) return;
             SyncRole();
 
+            long started = PerfStats.Begin();
             int epoch = reader.Int();
             int sequence = reader.Int();
             int count = reader.Int();
@@ -325,8 +334,11 @@ namespace PoECoop.Sync
             if (sequence <= 0) throw new FormatException("combat log sequence " + sequence);
             if (count < 0 || count > MaxTopLevelEntries) throw new FormatException("combat log entry count " + count);
 
+            // The whole batch is parsed and validated before any of it reaches the
+            // console; the nodes are built directly as the objects the console keeps.
             int nodes = 0, bytes = HeaderSize;
-            var entries = new List<Entry>(count);
+            List<Console.ConsoleMessage> entries = _incoming;
+            entries.Clear();
             for (int i = 0; i < count; i++)
             {
                 entries.Add(ReadNode(reader, 0, ref nodes, ref bytes));
@@ -335,7 +347,12 @@ namespace PoECoop.Sync
 
             // TCP cannot reorder a live stream. Ignoring an older sequence also
             // protects the UI if a caller ever retries a batch after reconnecting.
-            if (_hasEpoch && epoch == _guestEpoch && sequence <= _guestSequence) return;
+            if (_hasEpoch && epoch == _guestEpoch && sequence <= _guestSequence)
+            {
+                entries.Clear();
+                PerfStats.Count("combatlog.skipped", count);
+                return;
+            }
             if (!_hasEpoch || epoch != _guestEpoch)
             {
                 _hasEpoch = true;
@@ -349,10 +366,20 @@ namespace PoECoop.Sync
                 _session.Note("Combat log sequence gap: expected " + (_guestSequence + 1) + ", got " + sequence + ".");
             }
             _guestSequence = sequence;
-            Apply(entries);
+            try
+            {
+                Apply(entries);
+            }
+            finally
+            {
+                entries.Clear();
+            }
+            PerfStats.Count("combatlog.delta");
+            PerfStats.Count("combatlog.records", count);
+            PerfStats.End("combatlog.apply", started);
         }
 
-        private static Entry ReadNode(MessageReader reader, int depth, ref int nodes, ref int bytes)
+        private static Console.ConsoleMessage ReadNode(MessageReader reader, int depth, ref int nodes, ref int bytes)
         {
             if (depth > MaxDepth) throw new FormatException("combat log nesting exceeds two levels");
             nodes++;
@@ -375,24 +402,12 @@ namespace PoECoop.Sync
                 throw new FormatException("combat log child count " + childCount);
             if (depth == MaxDepth && childCount != 0) throw new FormatException("combat log nesting exceeds two levels");
 
-            var entry = new Entry
-            {
-                Mode = (Console.ConsoleState)mode,
-                Color = color,
-                Text = text,
-                Verbose = verbose,
-                Children = new List<Entry>(childCount),
-                NodeCount = 1,
-                WireSize = FixedNodeSize + StringSize(textBytes) + StringSize(verboseBytes),
-            };
-            for (int i = 0; i < childCount; i++)
-            {
-                Entry child = ReadNode(reader, depth + 1, ref nodes, ref bytes);
-                entry.Children.Add(child);
-                entry.NodeCount += child.NodeCount;
-                entry.WireSize += child.WireSize;
-            }
-            return entry;
+            var message = new Console.ConsoleMessage(text, verbose, (Console.ConsoleState)mode, color);
+            if (childCount == 0) return message;
+            var children = new List<Console.ConsoleMessage>(childCount);
+            for (int i = 0; i < childCount; i++) children.Add(ReadNode(reader, depth + 1, ref nodes, ref bytes));
+            message.Children = children;
+            return message;
         }
 
         private static string ReadString(MessageReader reader, int maxBytes, string which, out int byteCount)
@@ -403,31 +418,19 @@ namespace PoECoop.Sync
             return value;
         }
 
-        private static void Apply(List<Entry> entries)
+        private static void Apply(List<Console.ConsoleMessage> entries)
         {
             if (entries.Count == 0 || Console.Instance == null) return;
             bool wasApplying = ApplyingHostLog;
             ApplyingHostLog = true;
             try
             {
-                for (int i = 0; i < entries.Count; i++) Console.Instance.AddMessage(ToConsoleMessage(entries[i]));
+                for (int i = 0; i < entries.Count; i++) Console.Instance.AddMessage(entries[i]);
             }
             finally
             {
                 ApplyingHostLog = wasApplying;
             }
-        }
-
-        private static Console.ConsoleMessage ToConsoleMessage(Entry entry)
-        {
-            var message = new Console.ConsoleMessage(entry.Text, entry.Verbose, entry.Mode, entry.Color);
-            if (entry.Children.Count > 0)
-            {
-                var children = new List<Console.ConsoleMessage>(entry.Children.Count);
-                for (int i = 0; i < entry.Children.Count; i++) children.Add(ToConsoleMessage(entry.Children[i]));
-                message.Children = children;
-            }
-            return message;
         }
 
         // ---- shared ----

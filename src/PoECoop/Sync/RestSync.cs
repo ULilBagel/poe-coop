@@ -19,6 +19,8 @@ namespace PoECoop.Sync
         private const int FullRefreshMilliseconds = 2000;
         private const float FullRefreshInterval = FullRefreshMilliseconds / 1000f;
         private const float GuestRetryInterval = 0.25f;
+        // Keeps the periodic refresh out of phase with the other streams after a forced one.
+        private const float ForcedRefreshPhase = 0.90f;
         private const int MaxPartyRecords = 6;
         private const int MaxCachedRequestsPerPlayer = 256;
         private const int MaxSurvivalIndex = 4096;
@@ -417,6 +419,13 @@ namespace PoECoop.Sync
         public void Update(float now)
         {
             if (_disposed) return;
+            long perf = PerfStats.Begin();
+            UpdateCore(now);
+            PerfStats.End("rest.update", perf);
+        }
+
+        private void UpdateCore(float now)
+        {
             SyncContext();
             if (_session.IsHost)
             {
@@ -424,7 +433,8 @@ namespace PoECoop.Sync
                     && GameState.InCombat) CancelTransaction();
                 if (now >= _nextFullRefresh)
                 {
-                    _nextFullRefresh = now + FullRefreshInterval;
+                    // A reset deadline makes this a forced refresh, so the next one gets the phase offset.
+                    _nextFullRefresh = now + FullRefreshInterval + (_nextFullRefresh <= 0f ? ForcedRefreshPhase : 0f);
                     Publish();
                 }
                 if (_snapshot != null)
@@ -448,7 +458,9 @@ namespace PoECoop.Sync
             _nextGuestRetry = now + GuestRetryInterval;
             if (_snapshot != null)
             {
-                ApplyParty(_snapshot);
+                // Receipt already applied the party; retry only while a member is still unresolved.
+                if (_partyApplied.Count < _snapshot.Party.Count) ApplyParty(_snapshot);
+                else PerfStats.Count("rest.skipped");
                 Present(_snapshot);
                 CheckStashClosed();
             }
@@ -626,7 +638,9 @@ namespace PoECoop.Sync
             if (_disposed || reader.Type != MessageType.RestState) return;
             if (sender != null || !_session.IsGuest) throw new FormatException("unexpected rest state direction");
             SyncContext();
+            long perf = PerfStats.Begin();
             ReceiveSnapshot(reader);
+            PerfStats.End("rest.apply", perf);
         }
 
         /// <summary>Called by FlowCoordinator after it parses a Rest command envelope.</summary>
@@ -1068,7 +1082,9 @@ namespace PoECoop.Sync
         private long Publish(int targetPlayer = -1)
         {
             if (!_session.IsHost || _disposed || _worldEpoch <= 0) return _stateSeq;
+            long perf = PerfStats.Begin();
             Snapshot snapshot = Capture();
+            PerfStats.End("rest.capture", perf);
             if (_stateSeq == long.MaxValue)
             {
                 if (!_sequenceExhaustedLogged)
@@ -1086,8 +1102,15 @@ namespace PoECoop.Sync
             WriteSnapshot(message, snapshot);
             byte[] data = message.ToArray();
             if (data.Length > MaxStateBytes) throw new InvalidOperationException("rest snapshot exceeds its byte bound");
+            PerfStats.Count("rest.full");
             if (targetPlayer >= 0) _session.SendToPlayer(targetPlayer, data);
-            else _session.SendToGuests(data);
+            else
+            {
+                _session.SendToGuests(data);
+                // Forced broadcast (level change, world context, reset): phase the next periodic refresh.
+                if (_nextFullRefresh <= 0f)
+                    _nextFullRefresh = Time.unscaledTime + FullRefreshInterval + ForcedRefreshPhase;
+            }
             Present(snapshot);
             return _stateSeq;
         }

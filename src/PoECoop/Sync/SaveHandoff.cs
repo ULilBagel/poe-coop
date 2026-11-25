@@ -18,6 +18,9 @@ namespace PoECoop.Sync
         private const string GuestFilePrefix = "coop-session-";
         private const int ChunkSize = 256 * 1024;
         private const int MaxSaveSize = 256 * 1024 * 1024;
+        private const float SaveRetryInterval = 0.5f;
+        /// <summary>The blocked check reads a few flags; polling it faster shortens the frozen wait before a handoff.</summary>
+        private const float BlockedRetryInterval = 0.1f;
 
         private static readonly bool s_skipQuicksaveCheck =
             Array.IndexOf(Environment.GetCommandLineArgs(), "--coop-force-handoff") >= 0;
@@ -73,8 +76,8 @@ namespace PoECoop.Sync
             if (_session.IsHost)
             {
                 if (_waiting.Count == 0 || now < _nextTry) return;
-                _nextTry = now + 0.5f;
                 string reason = WhyHostCannotSave();
+                _nextTry = now + (reason == null ? SaveRetryInterval : BlockedRetryInterval);
                 if (reason == null) SendGame();
                 else if (reason != _waitReason)
                 {

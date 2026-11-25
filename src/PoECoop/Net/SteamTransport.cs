@@ -11,7 +11,7 @@ namespace PoECoop.Net
     /// private transport handshake/keepalive channel; channel 1 carries Session
     /// messages unchanged. All calls and backend callbacks run on the main thread.
     /// </summary>
-    public sealed class SteamTransport : ITransport
+    public sealed class SteamTransport : ITransport, ITransportStats
     {
         public const int MaxMessageSize = 1 << 20;
         public const int DefaultLobbyMembers = 6;
@@ -47,6 +47,9 @@ namespace PoECoop.Net
         private readonly Dictionary<int, Link> _links = new Dictionary<int, Link>();
         private readonly Dictionary<CSteamID, Link> _bySteamId = new Dictionary<CSteamID, Link>();
         private readonly Queue<QueuedEvent> _events = new Queue<QueuedEvent>();
+        private readonly List<Link> _timeoutScan = new List<Link>();
+        private int _sendPacketBudget = SendPacketsPerFrame;
+        private int _sendByteBudget = SendBytesPerFrame;
         private byte[] _invalidPacketBuffer;
         private IncomingPacket _lookahead;
         private CSteamID _localUser;
@@ -102,6 +105,29 @@ namespace PoECoop.Net
             && (_hosting || _guest);
         public string LobbyAddress => _lobbyId == CSteamID.Nil ? "" : _lobbyId.m_SteamID.ToString(CultureInfo.InvariantCulture);
         public string DisplayName => "Steam";
+
+        public int PendingIncomingMessages => _queuedIncomingMessages;
+        public long PendingIncomingBytes => _queuedIncomingBytes;
+
+        public int PendingOutgoingMessages
+        {
+            get
+            {
+                int total = 0;
+                foreach (var link in _links.Values) total += link.OutgoingMessages;
+                return total;
+            }
+        }
+
+        public long PendingOutgoingBytes
+        {
+            get
+            {
+                long total = 0;
+                foreach (var link in _links.Values) total += link.OutgoingBytes;
+                return total;
+            }
+        }
         public string Status
         {
             get
@@ -225,7 +251,9 @@ namespace PoECoop.Net
             }
             if (!_pumpedSinceEmpty)
             {
+                long started = PerfStats.Begin();
                 Pump();
+                PerfStats.End("transport.poll", started);
                 _pumpedSinceEmpty = true;
             }
             if (_events.Count == 0)
@@ -245,8 +273,41 @@ namespace PoECoop.Net
             if (_disposed) return;
             Link link;
             if (!_links.TryGetValue(connection, out link)) return;
-            if (link.Stage != LinkStage.Connected || !Enqueue(link, message, GameplayChannel, false))
+            long started = PerfStats.Begin();
+            if (link.Stage != LinkStage.Connected || !SendOrEnqueue(link, message))
                 CloseLink(link, "outgoing queue limit, invalid message, or handshake incomplete", true);
+            PerfStats.End("transport.send", started);
+        }
+
+        /// <summary>
+        /// Hands the message to Steam now when nothing older is waiting on this link and
+        /// this frame's send budget allows; otherwise it waits in order for the next pump.
+        /// Without this every message would sit until the following frame's first Poll.
+        /// </summary>
+        private bool SendOrEnqueue(Link link, byte[] message)
+        {
+            if (message == null || message.Length <= 0 || message.Length > MaxMessageSize || link.Closed) return false;
+            if (link.Outgoing.Count == 0 && _sendPacketBudget > 0 && message.Length <= _sendByteBudget)
+            {
+                bool sent;
+                try { sent = _backend.SendPacket(link.Remote, message, GameplayChannel); }
+                catch (Exception ex)
+                {
+                    CloseLink(link, ex.Message, true);
+                    return true;
+                }
+                if (sent)
+                {
+                    link.LastSend = Now();
+                    _sendPacketBudget--;
+                    _sendByteBudget -= message.Length;
+                    PerfStats.Count("transport.send.direct");
+                    return true;
+                }
+                PerfStats.Count("transport.send.refused");
+            }
+            PerfStats.Count("transport.send.queued");
+            return Enqueue(link, message, GameplayChannel, false);
         }
 
         public void Disconnect(int connection)
@@ -292,6 +353,8 @@ namespace PoECoop.Net
         private void Pump()
         {
             long now = Now();
+            _sendPacketBudget = SendPacketsPerFrame;
+            _sendByteBudget = SendBytesPerFrame;
             CheckTimeouts(now);
             if (_disposed || (!_hosting && !_guest)) return;
 
@@ -312,6 +375,7 @@ namespace PoECoop.Net
                 int gameplayPackets = GameplayPacketsPerFrame;
                 int gameplayBytes = GameplayBytesPerFrame;
                 ReceiveChannel(GameplayChannel, ref gameplayPackets, ref gameplayBytes, now);
+                if (gameplayPackets == 0) PerfStats.Count("transport.poll.budget_hit");
             }
             QueueKeepalives(now);
         }
@@ -324,7 +388,10 @@ namespace PoECoop.Net
                 else if (_guest) StopGuest("Steam lobby join timed out");
                 return;
             }
-            foreach (var link in new List<Link>(_links.Values))
+            if (_links.Count == 0) return;
+            _timeoutScan.Clear();
+            _timeoutScan.AddRange(_links.Values);
+            foreach (var link in _timeoutScan)
             {
                 if (link.Stage != LinkStage.Connected)
                 {
@@ -539,12 +606,15 @@ namespace PoECoop.Net
 
         private void FlushOutgoing(long now)
         {
-            int packetBudget = SendPacketsPerFrame;
-            int byteBudget = SendBytesPerFrame;
+            bool pending = false;
+            foreach (var link in _links.Values)
+                if (link.Outgoing.Count != 0) { pending = true; break; }
+            if (!pending) return;
+
             var links = new List<Link>(_links.Values);
             links.Sort((left, right) => left.Id.CompareTo(right.Id));
             var blocked = new HashSet<Link>();
-            while (packetBudget > 0)
+            while (_sendPacketBudget > 0)
             {
                 bool attempted = false;
                 bool sentAny = false;
@@ -553,7 +623,7 @@ namespace PoECoop.Net
                     if (link.Closed || link.Outgoing.Count == 0 || blocked.Contains(link)) continue;
                     attempted = true;
                     OutgoingPacket packet = link.Outgoing.Peek();
-                    if (packet.Data.Length > byteBudget) return;
+                    if (packet.Data.Length > _sendByteBudget) return;
                     bool sent;
                     try { sent = _backend.SendPacket(link.Remote, packet.Data, packet.Channel); }
                     catch (Exception ex) { CloseLink(link, ex.Message, true); continue; }
@@ -568,12 +638,12 @@ namespace PoECoop.Net
                     link.OutgoingBytes -= packet.Data.Length;
                     link.OutgoingMessages--;
                     link.LastSend = now;
-                    packetBudget--;
-                    byteBudget -= packet.Data.Length;
+                    _sendPacketBudget--;
+                    _sendByteBudget -= packet.Data.Length;
                     sentAny = true;
                     if (packet.IsServerHello && link.Stage == LinkStage.ServerHelloQueued)
                         ConnectLink(link);
-                    if (packetBudget == 0) break;
+                    if (_sendPacketBudget == 0) break;
                 }
                 if (!attempted || !sentAny) return;
             }

@@ -43,6 +43,8 @@ namespace PoECoop.Sync
         internal static DialogueSync Instance => s_instance;
         private static GameObject s_useActor;
         private static FlowChartPlayer s_chainSource;
+        // Main-thread scratch for the host's per-frame capture validation.
+        private static readonly HashSet<int> s_validateIds = new HashSet<int>();
 
         private readonly Session _session;
         private readonly DialoguePresentation _presentation;
@@ -196,6 +198,7 @@ namespace PoECoop.Sync
 
         public void Update(float now)
         {
+            long perf = PerfStats.Begin();
             SyncContext();
             if (_session.IsHost)
             {
@@ -213,10 +216,15 @@ namespace PoECoop.Sync
                     if (!current && retry)
                     {
                         _nextRetry = now + RetryInterval;
-                        if (_presentation.Apply(_guestLatest)) _guestAppliedSequence = _guestLatest.Sequence;
+                        long apply = PerfStats.Begin();
+                        bool applied = _presentation.Apply(_guestLatest);
+                        PerfStats.End("dialogue.apply", apply);
+                        if (applied) _guestAppliedSequence = _guestLatest.Sequence;
+                        else PerfStats.Count("dialogue.retry");
                     }
                 }
             }
+            PerfStats.End("dialogue.update", perf);
         }
 
         private void SyncContext()
@@ -416,7 +424,8 @@ namespace PoECoop.Sync
             FlowChartPlayer player = ConversationManager.Instance.GetActiveConversationForHUD();
             if (!IsHudPlayer(player))
             {
-                Publish(InactiveSnapshot());
+                // Publishing an inactive snapshot over an inactive one is a no-op; skip the per-frame allocation.
+                if (_lastSnapshot == null || _lastSnapshot.Active) Publish(InactiveSnapshot());
                 _active = null;
                 _hostConversations.Clear();
                 
@@ -425,7 +434,9 @@ namespace PoECoop.Sync
 
             HostConversation record = EnsureHostConversation(player);
             _active = record;
+            long perf = PerfStats.Begin();
             Snapshot snapshot = Capture(record);
+            PerfStats.End("dialogue.capture", perf);
             if (snapshot != null) Publish(snapshot);
             
 
@@ -557,6 +568,7 @@ namespace PoECoop.Sync
             if (_lastSnapshot != null && snapshot.SameContent(_lastSnapshot)) return;
             snapshot.Sequence = NextSequence();
             _lastSnapshot = snapshot;
+            PerfStats.Count("dialogue.full");
             SendSnapshot(snapshot, Session.HostId);
         }
 
@@ -693,7 +705,8 @@ namespace PoECoop.Sync
                 || snapshot.PickerId < 0 || snapshot.PickerId > 64) return false;
             if (!ValidString(snapshot.Filename, MaxFilenameBytes) || !ValidString(snapshot.Text, MaxTextBytes)) return false;
             int approximateBytes = StrictUtf8.GetByteCount(snapshot.Filename) + StrictUtf8.GetByteCount(snapshot.Text);
-            var ids = new HashSet<int>();
+            HashSet<int> ids = s_validateIds;
+            ids.Clear();
             foreach (ResponseState response in snapshot.Responses)
             {
                 if (!ValidNode(response.NodeId) || !ids.Add(response.NodeId)

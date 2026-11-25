@@ -21,10 +21,17 @@ namespace PoECoop.Sync
         private const float MaxSpeed = 16f;
         private const float MaxPosition = 100000f;
         private const float FullRefreshInterval = 3f;
+        // Added once after a forced refresh so the periodic refreshes of the
+        // different streams do not all land in the same frame.
+        private const float ForcedRefreshPhase = 2.85f;
+        private const float IdlePruneInterval = 1f;
         private const float GuestTimeout = 10f;
         private const byte OffhandFlag = 1;
         private const byte InstantFlag = 2;
         private const byte LoopFlag = 4;
+
+        private static readonly int InstantHash = Animator.StringToHash("Instant");
+        private static readonly int LoopHash = Animator.StringToHash("Loop");
 
         private static AttackVisualSync s_instance;
 
@@ -33,6 +40,10 @@ namespace PoECoop.Sync
         private readonly List<VisualEvent> _pending = new List<VisualEvent>();
         private readonly Dictionary<AttackBase, HostAction> _hostActions = new Dictionary<AttackBase, HostAction>();
         private readonly Dictionary<Guid, GuestAction> _guestActions = new Dictionary<Guid, GuestAction>();
+        private readonly List<VisualEvent> _received = new List<VisualEvent>();
+        private readonly List<AttackBase> _pruned = new List<AttackBase>();
+        private bool _anyHostActive;
+        private float _nextIdlePrune;
         private int _epoch;
         private int _sequence;
         private int _nextActionId;
@@ -54,8 +65,23 @@ namespace PoECoop.Sync
             public Vector3 TargetPosition;
         }
 
+        private struct Snapshot
+        {
+            public AnimationController.ActionType ActionType;
+            public int Variation;
+            public float Speed;
+            public byte Flags;
+        }
+
+        /// <summary>
+        /// One entry per AttackBase seen on the host. An entry that is not Tracked
+        /// only caches the owner's controller for an attack that has never started
+        /// an action; it is treated exactly like a missing entry.
+        /// </summary>
         private sealed class HostAction
         {
+            public bool Tracked;
+            public AnimationController Controller;
             public GameObject Owner;
             public Guid OwnerId;
             public GameObject Target;
@@ -151,29 +177,39 @@ namespace PoECoop.Sync
             if (_session.IsHost)
             {
                 if (!GameState.IsInGameSession || GameState.IsLoading) return;
-                PruneHostActions();
+                long started = PerfStats.Begin();
+                PruneHostActions(now);
                 if (_session.Players.Count < 2)
                 {
                     _pending.Clear();
+                    PerfStats.End("attackvisual.update", started);
                     return;
                 }
                 if (now >= _nextFullRefresh)
                 {
-                    _nextFullRefresh = now + FullRefreshInterval;
-                    foreach (HostAction action in _hostActions.Values)
+                    bool forced = _nextFullRefresh <= 0f;
+                    _nextFullRefresh = now + FullRefreshInterval + (forced ? ForcedRefreshPhase : 0f);
+                    PerfStats.Count("attackvisual.full");
+                    // Guests drop an action they have not heard about for GuestTimeout,
+                    // so every active action is repeated even when it has not changed.
+                    if (_anyHostActive)
                     {
-                        if (!action.Active || action.Last == null) continue;
-                        UpdateTarget(action);
-                        action.Last.Target = action.TargetId;
-                        action.Last.TargetPosition = action.TargetPosition;
-                        Queue(Copy(action.Last, Phase.Update));
+                        foreach (HostAction action in _hostActions.Values)
+                        {
+                            if (!action.Active || action.Last == null) continue;
+                            UpdateTarget(action);
+                            action.Last.Target = action.TargetId;
+                            action.Last.TargetPosition = action.TargetPosition;
+                            Queue(Copy(action.Last, Phase.Update));
+                        }
                     }
                 }
                 Flush();
+                PerfStats.End("attackvisual.update", started);
             }
             else if (_session.IsGuest)
             {
-                PruneGuestActions(now);
+                if (_guestActions.Count > 0) PruneGuestActions(now);
             }
         }
 
@@ -183,14 +219,18 @@ namespace PoECoop.Sync
         {
             AttackVisualSync self = s_instance;
             if (self == null || !self._session.IsHost || attack == null) return;
+            long started = PerfStats.Begin();
             self.BeginHostAction(attack, target, location, targetIsLocation);
+            PerfStats.End("attackvisual.capture", started);
         }
 
         internal static void HostVisualUpdate(AttackBase attack)
         {
             AttackVisualSync self = s_instance;
             if (self == null || !self._session.IsHost || attack == null) return;
+            long started = PerfStats.Begin();
             self.UpdateHostAction(attack);
+            PerfStats.End("attackvisual.capture", started);
         }
 
         internal static void HostInterrupted(AttackBase attack)
@@ -204,7 +244,8 @@ namespace PoECoop.Sync
         private void BeginHostAction(AttackBase attack, GameObject target, Vector3 location, bool targetIsLocation)
         {
             GameObject owner = attack.Owner;
-            if (owner == null || !TrySnapshot(owner.GetComponent<AnimationController>(), out VisualEvent visual))
+            AnimationController controller = owner != null ? owner.GetComponent<AnimationController>() : null;
+            if (owner == null || !TrySnapshot(controller, out Snapshot snapshot))
             {
                 if (_hostActions.TryGetValue(attack, out HostAction previous) && previous.Active)
                     FinishHostAction(previous, Phase.End);
@@ -215,8 +256,11 @@ namespace PoECoop.Sync
             if (ownerId == Guid.Empty) return;
             SupersedeOwnerActions(ownerId, attack);
 
+            VisualEvent visual = ToEvent(snapshot);
             HostAction action = new HostAction
             {
+                Tracked = true,
+                Controller = controller,
                 Owner = owner,
                 OwnerId = ownerId,
                 Target = target,
@@ -233,15 +277,28 @@ namespace PoECoop.Sync
             visual.TargetPosition = action.TargetPosition;
             action.Last = visual;
             _hostActions[attack] = action;
+            _anyHostActive = true;
             Queue(visual);
         }
 
         private void UpdateHostAction(AttackBase attack)
         {
-            if (!_hostActions.TryGetValue(attack, out HostAction action))
+            if (!_hostActions.TryGetValue(attack, out HostAction action) || !action.Tracked)
             {
+                // This runs every frame for every attack component that is not in
+                // use, so the owner's controller is cached instead of looked up.
                 GameObject owner = attack.Owner;
                 if (owner == null) return;
+                if (action == null || !ReferenceEquals(action.Owner, owner))
+                {
+                    action = new HostAction { Owner = owner, Controller = owner.GetComponent<AnimationController>() };
+                    _hostActions[attack] = action;
+                }
+                else if (action.Controller == null)
+                {
+                    action.Controller = owner.GetComponent<AnimationController>();
+                }
+                if (!TrySnapshot(action.Controller, out Snapshot _)) return;
                 BeginHostAction(attack, null, owner.transform.position, false);
                 return;
             }
@@ -251,19 +308,24 @@ namespace PoECoop.Sync
                 FinishHostAction(action, Phase.End);
                 return;
             }
-            if (!TrySnapshot(action.Owner.GetComponent<AnimationController>(), out VisualEvent current))
+            if (action.Controller == null) action.Controller = action.Owner.GetComponent<AnimationController>();
+            if (!TrySnapshot(action.Controller, out Snapshot snapshot))
             {
                 FinishHostAction(action, Phase.End);
                 return;
             }
 
             UpdateTarget(action);
-            if (SameVisual(action.Last, current))
+            if (SameVisual(action.Last, snapshot))
             {
                 action.Last.Target = action.TargetId;
                 action.Last.TargetPosition = action.TargetPosition;
+                PerfStats.Count("attackvisual.skipped");
                 return;
-            }            current.Owner = action.OwnerId;
+            }
+
+            VisualEvent current = ToEvent(snapshot);
+            current.Owner = action.OwnerId;
             current.ActionId = action.ActionId;
             current.Phase = Phase.Update;
             current.Target = action.TargetId;
@@ -292,34 +354,46 @@ namespace PoECoop.Sync
             return _nextActionId;
         }
 
-        private static bool TrySnapshot(AnimationController controller, out VisualEvent visual)
+        private static bool TrySnapshot(AnimationController controller, out Snapshot snapshot)
         {
-            visual = null;
-            if (controller == null || controller.DesiredAction == null) return false;
+            snapshot = default(Snapshot);
+            if (controller == null) return false;
             AnimationController.Action action = controller.DesiredAction;
+            if (action == null) return false;
             int type = (int)action.m_actionType;
             if (type <= (int)AnimationController.ActionType.None || type >= (int)AnimationController.ActionType.Pending) return false;
             if (action.m_variation < 0 || action.m_variation > MaxVariation || !IsFinite(action.m_speed)) return false;
 
             byte flags = action.m_offhand ? OffhandFlag : (byte)0;
-            if (controller.CurrentAvatar != null)
+            // Same parameters AnimationController.Instant/Loop read, without
+            // hashing the parameter name for every active action every frame.
+            Animator avatar = controller.CurrentAvatar;
+            if (avatar != null)
             {
-                if (controller.Instant) flags |= InstantFlag;
-                if (controller.Loop) flags |= LoopFlag;
+                if (avatar.GetBool(InstantHash)) flags |= InstantFlag;
+                if (avatar.GetBool(LoopHash)) flags |= LoopFlag;
             }
-            visual = new VisualEvent
-            {
-                ActionType = action.m_actionType,
-                Variation = action.m_variation,
-                Speed = Mathf.Clamp(action.m_speed, 0f, MaxSpeed),
-                Flags = flags,
-            };
+            snapshot.ActionType = action.m_actionType;
+            snapshot.Variation = action.m_variation;
+            snapshot.Speed = Mathf.Clamp(action.m_speed, 0f, MaxSpeed);
+            snapshot.Flags = flags;
             return true;
         }
 
-        private static bool SameVisual(VisualEvent a, VisualEvent b)
+        private static VisualEvent ToEvent(Snapshot snapshot)
         {
-            return a != null && b != null && a.ActionType == b.ActionType && a.Variation == b.Variation
+            return new VisualEvent
+            {
+                ActionType = snapshot.ActionType,
+                Variation = snapshot.Variation,
+                Speed = snapshot.Speed,
+                Flags = snapshot.Flags,
+            };
+        }
+
+        private static bool SameVisual(VisualEvent a, Snapshot b)
+        {
+            return a != null && a.ActionType == b.ActionType && a.Variation == b.Variation
                 && Mathf.Abs(a.Speed - b.Speed) < 0.001f && a.Flags == b.Flags;
         }
 
@@ -392,12 +466,21 @@ namespace PoECoop.Sync
                 }
                 _pending.RemoveRange(0, count);
                 _session.SendToGuests(message.ToArray());
+                PerfStats.Count("attackvisual.delta");
+                PerfStats.Count("attackvisual.records", count);
             }
         }
 
-        private void PruneHostActions()
+        /// <summary>
+        /// Ends active actions whose attack or owner went away. While nothing is
+        /// active the pass only frees entries of destroyed attacks, so it runs at
+        /// IdlePruneInterval instead of every frame.
+        /// </summary>
+        private void PruneHostActions(float now)
         {
-            List<AttackBase> remove = null;
+            if (!_anyHostActive && now < _nextIdlePrune) return;
+            _nextIdlePrune = now + IdlePruneInterval;
+            bool anyActive = false;
             foreach (var pair in _hostActions)
             {
                 HostAction action = pair.Value;
@@ -405,13 +488,16 @@ namespace PoECoop.Sync
                 {
                     if (action.Active && (!pair.Key.isActiveAndEnabled || !action.Owner.activeInHierarchy))
                         FinishHostAction(action, Phase.End);
+                    anyActive |= action.Active;
                     continue;
                 }
                 if (action.Active) FinishHostAction(action, Phase.End);
-                (remove ?? (remove = new List<AttackBase>())).Add(pair.Key);
+                _pruned.Add(pair.Key);
             }
-            if (remove == null) return;
-            foreach (AttackBase attack in remove) _hostActions.Remove(attack);
+            _anyHostActive = anyActive;
+            if (_pruned.Count == 0) return;
+            for (int i = 0; i < _pruned.Count; i++) _hostActions.Remove(_pruned[i]);
+            _pruned.Clear();
         }
 
         // ---- guest presentation ----
@@ -420,13 +506,14 @@ namespace PoECoop.Sync
         {
             if (sender != null || reader.Type != MessageType.AttackVisuals || !_session.IsGuest) return;
             SyncGuestSession();
+            long started = PerfStats.Begin();
             int epoch = reader.Int();
             int sequence = reader.Int();
             int count = reader.Int();
             if (epoch < 0 || sequence < 0) throw new FormatException("attack visual epoch/sequence");
             if (count < 0 || count > MaxEventsPerMessage) throw new FormatException("attack visual count " + count);
 
-            var events = new List<VisualEvent>(count);
+            // Events are not kept after they are applied, so the objects are reused.
             for (int i = 0; i < count; i++)
             {
                 Guid owner = reader.Guid();
@@ -444,29 +531,35 @@ namespace PoECoop.Sync
                     || (flags & ~(OffhandFlag | InstantFlag | LoopFlag)) != 0
                     || !IsFinite(targetPosition) || !WithinBounds(targetPosition))
                     throw new FormatException("invalid attack visual");
-                events.Add(new VisualEvent
-                {
-                    Owner = owner,
-                    ActionId = actionId,
-                    Phase = phase,
-                    ActionType = (AnimationController.ActionType)actionType,
-                    Variation = variation,
-                    Speed = speed,
-                    Flags = flags,
-                    Target = target,
-                    TargetPosition = targetPosition,
-                });
+                VisualEvent visual;
+                if (i < _received.Count) visual = _received[i];
+                else _received.Add(visual = new VisualEvent());
+                visual.Owner = owner;
+                visual.ActionId = actionId;
+                visual.Phase = phase;
+                visual.ActionType = (AnimationController.ActionType)actionType;
+                visual.Variation = variation;
+                visual.Speed = speed;
+                visual.Flags = flags;
+                visual.Target = target;
+                visual.TargetPosition = targetPosition;
             }
 
-            if (_guestEpoch >= 0 && epoch < _guestEpoch) return;
-            if (epoch == _guestEpoch && sequence <= _guestSequence) return;
+            if (_guestEpoch >= 0 && epoch < _guestEpoch || epoch == _guestEpoch && sequence <= _guestSequence)
+            {
+                PerfStats.Count("attackvisual.skipped", count);
+                PerfStats.End("attackvisual.apply", started);
+                return;
+            }
             if (epoch != _guestEpoch)
             {
                 ClearGuestActions(false);
                 _guestEpoch = epoch;
             }
             _guestSequence = sequence;
-            foreach (VisualEvent visual in events) ApplyGuestEvent(visual);
+            for (int i = 0; i < count; i++) ApplyGuestEvent(_received[i]);
+            PerfStats.Count("attackvisual.records", count);
+            PerfStats.End("attackvisual.apply", started);
         }
 
         private void ApplyGuestEvent(VisualEvent visual)

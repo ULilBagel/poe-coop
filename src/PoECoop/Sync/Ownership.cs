@@ -66,6 +66,7 @@ namespace PoECoop.Sync
 
         public int OwnerOf(PartyMemberAI member)
         {
+            PerfStats.Count("ownership.lookups");
             // Follow summons and animal companions up to the party member they belong to.
             for (int depth = 0; member != null && depth < 4; depth++)
             {
@@ -112,10 +113,12 @@ namespace PoECoop.Sync
                 return;
             }
             if (!_selectionDirty || !GameState.IsInGameSession || GameState.IsLoading) return;
+            long started = PerfStats.Begin();
             _selectionDirty = false;
             // Let go of characters that are no longer the local player's.
             foreach (PartyMemberAI member in PartyMemberAI.PartyMembers)
                 if (member != null && member.Selected && !IsMine(member)) member.Selected = false;
+            PerfStats.End("ownership.update", started);
         }
 
         public static Guid IdOf(PartyMemberAI member)

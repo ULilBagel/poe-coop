@@ -14,6 +14,8 @@ namespace PoECoop.Sync
     {
         private const float SendInterval = 0.1f;
         private const float FullRefreshInterval = 3f;
+        // Keeps the periodic refresh out of the frame the other streams use after a forced one.
+        private const float FullRefreshPhase = 1.05f;
         private const float MaxCombatDuration = 31536000f;
         private const float MaxGameOverDelay = 3600f;
 
@@ -82,10 +84,17 @@ namespace PoECoop.Sync
             _nextSend = now + SendInterval;
             if (_session.Players.Count < 2 || !GameState.IsInGameSession || GameState.IsLoading) return;
 
+            long started = PerfStats.Begin();
             bool full = now >= _nextFullRefresh;
-            if (full) _nextFullRefresh = now + FullRefreshInterval;
+            // A forced refresh (join, level load) is immediate; later ones keep their own phase.
+            if (full) _nextFullRefresh = now + FullRefreshInterval + (_nextFullRefresh <= 0f ? FullRefreshPhase : 0f);
             var sample = Capture();
-            if (!full && _hasSent && Same(_sent, sample)) return;
+            if (!full && _hasSent && Same(_sent, sample))
+            {
+                PerfStats.Count("combatstate.skipped");
+                PerfStats.End("combatstate.capture", started);
+                return;
+            }
 
             byte[] data = new MessageWriter(MessageType.CombatState).Int(_epoch).Int(_revision + 1)
                 .Int(sample.Flags).Float(sample.CombatDuration).Float(sample.GameOverDelay).ToArray();
@@ -93,6 +102,9 @@ namespace PoECoop.Sync
             _sent = sample;
             _hasSent = true;
             _revision++;
+            PerfStats.Count(full ? "combatstate.full" : "combatstate.delta");
+            PerfStats.Count("combatstate.records");
+            PerfStats.End("combatstate.capture", started);
         }
 
         private static Sample Capture()
@@ -127,8 +139,13 @@ namespace PoECoop.Sync
             float combatDuration = ReadBounded(reader.Float(), MaxCombatDuration, "combat duration");
             float gameOverDelay = ReadBounded(reader.Float(), MaxGameOverDelay, "game-over delay");
             if ((flags & ~15) != 0) throw new FormatException("combat state flags " + flags);
-            if (epoch == _epoch && revision <= _revision) return;
+            if (epoch == _epoch && revision <= _revision)
+            {
+                PerfStats.Count("combatstate.skipped");
+                return;
+            }
 
+            long started = PerfStats.Begin();
             _epoch = epoch;
             _revision = revision;
             InCombatField.SetValue(null, (flags & 1) != 0);
@@ -137,6 +154,8 @@ namespace PoECoop.Sync
             GameState.PartyDead = (flags & 8) != 0;
             CombatDurationField.SetValue(null, combatDuration);
             GameOverDelayField.SetValue(null, gameOverDelay);
+            PerfStats.Count("combatstate.records");
+            PerfStats.End("combatstate.apply", started);
         }
 
         private void Clear()

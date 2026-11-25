@@ -22,6 +22,13 @@ namespace PoECoop.Sync
         private const int MaxAbilityKeyLength = 96;
         private const float FullRefreshInterval = 3f;
         private const float RetryInterval = 0.25f;
+        private const float MaxRetryInterval = 4f;
+        private const int MaxRetryDoublings = 4;
+        /// <summary>An unchanged manifest is only re-sent this often; changes still go out as deltas at once.</summary>
+        private const float IntegrityInterval = 12f;
+        private const float ForcedRefreshPhase = 0.45f;
+        private const int MaxCachedPrefabKeys = 1024;
+        private const int MaxCachedPrefabKeyLength = 128;
         private const float MaxCoordinate = 1000000f;
         private const float MaxScale = 100f;
 
@@ -47,11 +54,35 @@ namespace PoECoop.Sync
         private readonly HashSet<Guid> _dirty = new HashSet<Guid>();
         private readonly HashSet<Guid> _removed = new HashSet<Guid>();
         private readonly HashSet<Guid> _pending = new HashSet<Guid>();
+        private readonly HashSet<GameObject> _projectiles = new HashSet<GameObject>();
         private int _epoch = 1;
         private int _revision;
         private float _nextFullRefresh;
         private float _nextRetry;
         private bool _wasGuest;
+
+        // Host: a full manifest is sent when forced, when anything changed since the last one, or at the integrity interval.
+        private bool _forceFull = true;
+        private bool _changedSinceFull;
+        private float _nextIntegrity;
+
+        // Guest: local repair between host manifests, and retry pacing.
+        private float _nextGuestRepair;
+        private int _bindVersion;
+        private int _retryBindVersion;
+        private readonly List<Guid> _scratchIds = new List<Guid>();
+        private readonly List<GameObject> _scratchObjects = new List<GameObject>();
+        private readonly HashSet<Guid> _seen = new HashSet<Guid>();
+
+        // Guest: object scans shared by every definition applied in one message or retry pass.
+        private int _scanDepth;
+        private bool _savedIndexValid;
+        private readonly Dictionary<Guid, GameObject> _savedIndex = new Dictionary<Guid, GameObject>();
+        private Transform[] _sceneTransforms;
+        private Vector3[] _sceneTransformPositions;
+
+        private static readonly Dictionary<GameObject, Guid> NoObjects = new Dictionary<GameObject, Guid>();
+        private static readonly Dictionary<string, string> PrefabKeys = new Dictionary<string, string>(StringComparer.Ordinal);
 
         private StreamWriter _probe;
         private DataContractJsonSerializer _probeFrameSerializer;
@@ -136,11 +167,20 @@ namespace PoECoop.Sync
         {
             public GameObject Object;
             public Definition Definition;
+            /// <summary>Host: the entity and this active flag have been sent since the last forced manifest.</summary>
+            public bool Sent, SentActive;
+            /// <summary>Guest: the definition came from the host rather than from a local saved-id lookup.</summary>
+            public bool Remote;
+            /// <summary>Guest: failed creation attempts since the definition last changed, and the earliest next one.</summary>
+            public int Attempts;
+            public float NextAttempt;
         }
 
         internal static bool IsApplying => s_applyDepth > 0;
-        internal static IEnumerable<GameObject> RegisteredObjects =>
-            s_instance != null ? (IEnumerable<GameObject>)s_instance._byObject.Keys : Array.Empty<GameObject>();
+        /// <summary>Lets per-frame patches skip building ProbeBlocked arguments while the probe is off.</summary>
+        internal static bool Probing => s_instance != null && s_instance._probe != null;
+        internal static Dictionary<GameObject, Guid>.KeyCollection RegisteredObjects =>
+            s_instance != null ? s_instance._byObject.Keys : NoObjects.Keys;
 
         public EntityRegistry(Session session)
         {
@@ -148,6 +188,7 @@ namespace PoECoop.Sync
             s_instance = this;
             session.GameMessage += OnGameMessage;
             session.PlayerJoined += OnPlayerJoined;
+            session.FullStateRequested += OnFullStateRequested;
             GameState.OnLevelLoaded += OnLevelChanged;
             GameState.OnLevelUnload += OnLevelChanged;
             InitializeProbe();
@@ -159,6 +200,7 @@ namespace PoECoop.Sync
             GameState.OnLevelUnload -= OnLevelChanged;
             _session.GameMessage -= OnGameMessage;
             _session.PlayerJoined -= OnPlayerJoined;
+            _session.FullStateRequested -= OnFullStateRequested;
             if (s_instance == this)
             {
                 s_instance = null;
@@ -166,19 +208,24 @@ namespace PoECoop.Sync
             }
             _byId.Clear();
             _byObject.Clear();
+            _projectiles.Clear();
             _dirty.Clear();
             _removed.Clear();
             _pending.Clear();
+            ReleaseScans();
             _probe?.Dispose();
         }
 
         /// <summary>The saved id, or the host-assigned id for a runtime actor. Empty if it cannot be networked.</summary>
         public static Guid NetworkId(GameObject obj)
         {
-            if (obj == null || obj.GetComponent<Projectile>() != null) return Guid.Empty;
+            if (obj == null) return Guid.Empty;
             EntityRegistry self = s_instance;
+            // Mapped objects were checked for a Projectile when they were mapped.
+            if (self != null && self._byObject.TryGetValue(obj, out Guid known))
+                return self._projectiles.Count > 0 && self._projectiles.Contains(obj) ? Guid.Empty : known;
+            if (obj.GetComponent<Projectile>() != null) return Guid.Empty;
             if (self == null) return ReadSavedId(obj);
-            if (self._byObject.TryGetValue(obj, out Guid known)) return known;
             return self.Register(obj, Origin.Prefab, Guid.Empty, 0, (string)null, Guid.Empty);
         }
 
@@ -192,6 +239,7 @@ namespace PoECoop.Sync
                 if (entity.Object != null) return entity.Object;
                 if (self._session.IsHost)
                 {
+                    // The object key stays for RemoveDestroyed: callers may be enumerating RegisteredObjects.
                     self._byId.Remove(id);
                     self._pending.Remove(id);
                 }
@@ -206,28 +254,134 @@ namespace PoECoop.Sync
         {
             WriteProbe(now);
             SyncGuestSession();
-            if (_session.IsHost)
+            if (_session.IsHost) UpdateHost(now);
+            else if (_session.IsGuest) UpdateGuest(now);
+        }
+
+        private void UpdateHost(float now)
+        {
+            long started = PerfStats.Begin();
+            RemoveDestroyed();
+            bool connected = _session.Players.Count >= 2 && GameState.IsInGameSession && !GameState.IsLoading;
+            bool periodic = connected && (_forceFull || now >= _nextFullRefresh);
+            bool full = periodic && (_forceFull || _changedSinceFull || _removed.Count > 0 || _dirty.Count > 0
+                || now >= _nextIntegrity || ActiveStateChanged());
+            PerfStats.End("entity.update", started);
+            if (!connected) return;
+
+            started = PerfStats.Begin();
+            if (_removed.Count > 0) SendRemovals();
+            if (periodic)
             {
-                RemoveDestroyed();
-                if (_session.Players.Count < 2 || !GameState.IsInGameSession || GameState.IsLoading) return;
-                if (_removed.Count > 0) SendRemovals();
-                if (now >= _nextFullRefresh)
+                // A forced manifest is followed by a later periodic one so the streams do not all refresh in one frame.
+                _nextFullRefresh = now + FullRefreshInterval + (_forceFull ? ForcedRefreshPhase : 0f);
+                if (full)
                 {
-                    _nextFullRefresh = now + FullRefreshInterval;
+                    _forceFull = false;
+                    _nextIntegrity = now + IntegrityInterval;
                     SendDefinitions(null, true);
                 }
-                else if (_dirty.Count > 0) SendDefinitions(_dirty, false);
+                else PerfStats.Count("entity.skipped");
             }
-            else if (_session.IsGuest && _pending.Count > 0 && now >= _nextRetry)
+            else if (_dirty.Count > 0) SendDefinitions(_dirty, false);
+            PerfStats.End("entity.capture", started);
+        }
+
+        /// <summary>Active flags have no dirty path; they are sampled at the refresh cadence the guest was already given.</summary>
+        private bool ActiveStateChanged()
+        {
+            foreach (Entity entity in _byId.Values)
+            {
+                if (entity.Object == null) continue;
+                if (!entity.Sent || entity.SentActive != entity.Object.activeSelf) return true;
+            }
+            return false;
+        }
+
+        private void UpdateGuest(float now)
+        {
+            bool repair = now >= _nextGuestRepair && _session.IsWorldReady;
+            if (!repair && (_pending.Count == 0 || now < _nextRetry)) return;
+            long started = PerfStats.Begin();
+            if (repair)
+            {
+                _nextGuestRepair = now + FullRefreshInterval;
+                RepairGuest();
+            }
+            if (_pending.Count > 0 && now >= _nextRetry)
             {
                 _nextRetry = now + RetryInterval;
-                var retry = new List<Guid>(_pending);
-                foreach (Guid id in retry)
+                RetryPending(now);
+            }
+            PerfStats.End("entity.update", started);
+        }
+
+        /// <summary>
+        /// What an unchanged host manifest used to do for bound entities every refresh:
+        /// restore the host's active flag and queue entities whose object went away.
+        /// </summary>
+        private void RepairGuest()
+        {
+            _scratchObjects.Clear();
+            foreach (var pair in _byId)
+            {
+                Entity entity = pair.Value;
+                if (!entity.Remote || entity.Definition == null) continue;
+                if (entity.Object == null)
                 {
-                    if (_byId.TryGetValue(id, out Entity entity) && entity.Object == null)
-                        ApplyDefinition(entity.Definition);
-                    else _pending.Remove(id);
+                    if (_pending.Add(pair.Key))
+                    {
+                        entity.Attempts = 0;
+                        entity.NextAttempt = 0f;
+                    }
                 }
+                else if (entity.Object.activeSelf != entity.Definition.Active) _scratchObjects.Add(entity.Object);
+            }
+            // Activation can run game code that resolves ids, so it happens after the walk.
+            for (int i = 0; i < _scratchObjects.Count; i++)
+            {
+                GameObject obj = _scratchObjects[i];
+                if (obj == null || !_byObject.TryGetValue(obj, out Guid id) || !_byId.TryGetValue(id, out Entity entity)) continue;
+                if (entity.Object == obj && obj.activeSelf != entity.Definition.Active) obj.SetActive(entity.Definition.Active);
+            }
+            _scratchObjects.Clear();
+        }
+
+        private void RetryPending(float now)
+        {
+            // A new binding can be the parent or owner another pending entity was waiting for.
+            bool kick = _retryBindVersion != _bindVersion;
+            _retryBindVersion = _bindVersion;
+            bool settled = !GameState.IsLoading && GameState.IsInGameSession;
+            _scratchIds.Clear();
+            foreach (Guid id in _pending) _scratchIds.Add(id);
+            BeginScans();
+            try
+            {
+                for (int i = 0; i < _scratchIds.Count; i++)
+                {
+                    Guid id = _scratchIds[i];
+                    if (!_byId.TryGetValue(id, out Entity entity) || entity.Object != null)
+                    {
+                        _pending.Remove(id);
+                        continue;
+                    }
+                    if (!kick && now < entity.NextAttempt)
+                    {
+                        PerfStats.Count("entity.skipped");
+                        continue;
+                    }
+                    PerfStats.Count("entity.retry");
+                    if (ApplyDefinition(entity.Definition)) continue;
+                    // Nothing can be created while loading, so waiting there is not a failure.
+                    if (settled && entity.Attempts < MaxRetryDoublings) entity.Attempts++;
+                    entity.NextAttempt = now + Mathf.Min(RetryInterval * (1 << entity.Attempts), MaxRetryInterval);
+                }
+            }
+            finally
+            {
+                EndScans();
+                _scratchIds.Clear();
             }
         }
 
@@ -236,6 +390,7 @@ namespace PoECoop.Sync
             if (_session.IsHost)
             {
                 _nextFullRefresh = 0f;
+                _forceFull = true;
                 return;
             }
             if (_session.IsGuest && player.IsHost)
@@ -243,6 +398,14 @@ namespace PoECoop.Sync
                 ResetGuestSession();
                 _wasGuest = true;
             }
+        }
+
+        /// <summary>A guest that has just become ready received nothing while it loaded.</summary>
+        private void OnFullStateRequested(int playerId, long worldEpoch)
+        {
+            if (!_session.IsHost) return;
+            _nextFullRefresh = 0f;
+            _forceFull = true;
         }
 
         private void SyncGuestSession()
@@ -263,6 +426,7 @@ namespace PoECoop.Sync
             _epoch = 1;
             _revision = 0;
             _nextFullRefresh = 0f;
+            _forceFull = true;
             _nextRetry = 0f;
             _dirty.Clear();
             _removed.Clear();
@@ -273,12 +437,16 @@ namespace PoECoop.Sync
             _epoch = _epoch == int.MaxValue ? 1 : _epoch + 1;
             _revision = 0;
             _nextFullRefresh = 0f;
+            _forceFull = true;
+            _changedSinceFull = false;
             _nextRetry = 0f;
             _byId.Clear();
             _byObject.Clear();
+            _projectiles.Clear();
             _dirty.Clear();
             _removed.Clear();
             _pending.Clear();
+            ReleaseScans();
         }
 
         // ---- host registration and capture ----
@@ -286,7 +454,11 @@ namespace PoECoop.Sync
         private static Guid ReadSavedId(GameObject obj)
         {
             var instance = obj.GetComponent<InstanceID>();
-            if (instance == null) return Guid.Empty;
+            return instance != null ? ReadSavedId(instance) : Guid.Empty;
+        }
+
+        private static Guid ReadSavedId(InstanceID instance)
+        {
             Guid id = StoredId(instance);
             if (id != Guid.Empty) return id;
             return !string.IsNullOrEmpty(instance.UniqueID) && Guid.TryParse(instance.UniqueID, out id) ? id : Guid.Empty;
@@ -346,7 +518,7 @@ namespace PoECoop.Sync
                 _byId[id] = new Entity { Object = obj, Definition = definition };
                 _dirty.Add(id);
             }
-            _byObject[obj] = id;
+            MapObject(obj, id);
             _removed.Remove(id);
             return id;
         }
@@ -358,7 +530,7 @@ namespace PoECoop.Sync
                 if (existing.Object == null || existing.Object == obj)
                 {
                     existing.Object = obj;
-                    _byObject[obj] = id;
+                    MapObject(obj, id);
                     _pending.Remove(id);
                 }
                 return;
@@ -374,7 +546,23 @@ namespace PoECoop.Sync
                 Active = obj.activeSelf,
             };
             _byId[id] = new Entity { Object = obj, Definition = definition };
+            MapObject(obj, id);
+        }
+
+        private void MapObject(GameObject obj, Guid id)
+        {
+            if (!_byObject.ContainsKey(obj))
+            {
+                _bindVersion++;
+                if (obj.GetComponent<Projectile>() != null) _projectiles.Add(obj);
+            }
             _byObject[obj] = id;
+        }
+
+        private void UnmapObject(GameObject obj)
+        {
+            _byObject.Remove(obj);
+            if (_projectiles.Count > 0) _projectiles.Remove(obj);
         }
 
         internal static void CaptureEncounter(Encounter encounter)
@@ -476,12 +664,29 @@ namespace PoECoop.Sync
 
         private void RemoveDestroyed()
         {
-            List<GameObject> gone = null;
+            _scratchObjects.Clear();
             foreach (GameObject obj in _byObject.Keys)
-                if (obj == null) (gone ?? (gone = new List<GameObject>())).Add(obj);
-            if (gone == null) return;
-            foreach (GameObject obj in gone)
-                if (_byObject.TryGetValue(obj, out Guid id)) RemoveHost(id);
+                if (obj == null) _scratchObjects.Add(obj);
+            if (_scratchObjects.Count == 0) return;
+            for (int i = 0; i < _scratchObjects.Count; i++)
+            {
+                GameObject obj = _scratchObjects[i];
+                if (!_byObject.TryGetValue(obj, out Guid id)) continue;
+                if (_byId.TryGetValue(id, out Entity entity))
+                {
+                    if (ReferenceEquals(entity.Object, obj)) RemoveHost(id);
+                    else UnmapObject(obj);
+                }
+                else
+                {
+                    // ResolveObject already dropped the entity. Without removing the key here the
+                    // removal was queued and sent again on every later frame.
+                    UnmapObject(obj);
+                    _dirty.Remove(id);
+                    _removed.Add(id);
+                }
+            }
+            _scratchObjects.Clear();
         }
 
         private void RemoveHostObject(GameObject obj)
@@ -500,7 +705,7 @@ namespace PoECoop.Sync
         private void RemoveMapping(Guid id)
         {
             if (!_byId.TryGetValue(id, out Entity entity)) return;
-            if (!ReferenceEquals(entity.Object, null)) _byObject.Remove(entity.Object);
+            if (!ReferenceEquals(entity.Object, null)) UnmapObject(entity.Object);
             _byId.Remove(id);
         }
 
@@ -508,25 +713,38 @@ namespace PoECoop.Sync
 
         private void SendDefinitions(ICollection<Guid> selected, bool full)
         {
-            var ids = new List<Guid>();
-            if (selected == null) ids.AddRange(_byId.Keys);
-            else ids.AddRange(selected);
             var message = new MessageWriter(MessageType.EntityDefine)
                 .Int(_epoch).Int(NextRevision()).Byte((byte)(full ? 1 : 0)).Int(0);
             int count = 0;
-            foreach (Guid id in ids)
+            if (selected == null)
             {
-                if (!_byId.TryGetValue(id, out Entity entity) || entity.Object == null || count >= MaxEntities) continue;
-                Definition d = entity.Definition;
-                d.Active = entity.Object.activeSelf;
-                if (!ValidTransform(d.Position, d.Rotation, d.Scale)) continue;
-                WriteDefinition(message, d);
-                count++;
+                foreach (Entity entity in _byId.Values)
+                    if (WriteEntity(message, entity, count)) count++;
+            }
+            else
+            {
+                foreach (Guid id in selected)
+                    if (_byId.TryGetValue(id, out Entity entity) && WriteEntity(message, entity, count)) count++;
             }
             byte[] data = message.ToArray();
             WriteCount(data, 1 + 4 + 4 + 1, count);
             _session.SendToGuests(data);
             _dirty.Clear();
+            _changedSinceFull = !full;
+            PerfStats.Count(full ? "entity.full" : "entity.delta");
+            PerfStats.Count("entity.records", count);
+        }
+
+        private static bool WriteEntity(MessageWriter message, Entity entity, int count)
+        {
+            if (entity.Object == null || count >= MaxEntities) return false;
+            Definition d = entity.Definition;
+            d.Active = entity.Object.activeSelf;
+            if (!ValidTransform(d.Position, d.Rotation, d.Scale)) return false;
+            WriteDefinition(message, d);
+            entity.Sent = true;
+            entity.SentActive = d.Active;
+            return true;
         }
 
         private void SendRemovals()
@@ -543,6 +761,7 @@ namespace PoECoop.Sync
             WriteCount(data, 1 + 4 + 4, count);
             _session.SendToGuests(data);
             _removed.Clear();
+            _changedSinceFull = true;
         }
 
         private int NextRevision()
@@ -583,6 +802,21 @@ namespace PoECoop.Sync
         {
             if (sender != null || !_session.IsGuest) return;
             if (reader.Type != MessageType.EntityDefine && reader.Type != MessageType.EntityRemove) return;
+            long started = PerfStats.Begin();
+            BeginScans();
+            try
+            {
+                ApplyMessage(reader);
+            }
+            finally
+            {
+                EndScans();
+                PerfStats.End("entity.apply", started);
+            }
+        }
+
+        private void ApplyMessage(MessageReader reader)
+        {
             SyncGuestSession();
             int epoch = reader.Int();
             int revision = reader.Int();
@@ -604,7 +838,10 @@ namespace PoECoop.Sync
             if (fullFlag > 1) throw new FormatException("entity full flag");
             int definitions = reader.Int();
             CheckCount(definitions);
-            var seen = new HashSet<Guid>();
+            PerfStats.Count(fullFlag != 0 ? "entity.full" : "entity.delta");
+            PerfStats.Count("entity.records", definitions);
+            HashSet<Guid> seen = _seen;
+            seen.Clear();
             for (int i = 0; i < definitions; i++)
             {
                 Definition definition = ReadDefinition(reader);
@@ -612,18 +849,27 @@ namespace PoECoop.Sync
                 Entity entity;
                 if (!_byId.TryGetValue(definition.Id, out entity))
                     _byId[definition.Id] = entity = new Entity();
+                if (!entity.Remote || entity.Definition == null || !entity.Definition.SameRecipe(definition))
+                {
+                    entity.Attempts = 0;
+                    entity.NextAttempt = 0f;
+                }
+                entity.Remote = true;
                 entity.Definition = definition;
                 if (entity.Object == null) _pending.Add(definition.Id);
                 ApplyDefinition(definition);
             }
             if (fullFlag != 0)
             {
+                // The manifest just repaired everything the local pass would.
+                _nextGuestRepair = Time.unscaledTime + FullRefreshInterval;
                 List<Guid> absent = null;
                 foreach (var pair in _byId)
                     if (pair.Value.Definition.Origin != Origin.Saved && !seen.Contains(pair.Key))
                         (absent ?? (absent = new List<Guid>())).Add(pair.Key);
                 if (absent != null) foreach (Guid id in absent) RemoveRemote(id, true);
             }
+            seen.Clear();
         }
 
         private static void CheckCount(int count)
@@ -679,6 +925,7 @@ namespace PoECoop.Sync
             if (old != null) foreach (Guid id in old) RemoveRemote(id, true);
             _byId.Clear();
             _byObject.Clear();
+            _projectiles.Clear();
             _pending.Clear();
         }
 
@@ -687,7 +934,7 @@ namespace PoECoop.Sync
             if (id == Guid.Empty || !_byId.TryGetValue(id, out Entity entity)) return;
             GameObject obj = entity.Object;
             ProbeEvent("guest-entity-remove", entity.Definition, obj != null ? obj.name : "already-destroyed");
-            if (!ReferenceEquals(obj, null)) _byObject.Remove(obj);
+            if (!ReferenceEquals(obj, null)) UnmapObject(obj);
             _byId.Remove(id);
             _pending.Remove(id);
             if (destroy && obj != null)
@@ -750,30 +997,93 @@ namespace PoECoop.Sync
             }
             if (!_byId.TryGetValue(d.Id, out Entity entity))
                 _byId[d.Id] = entity = new Entity();
-            if (!ReferenceEquals(entity.Object, null) && !ReferenceEquals(entity.Object, obj)) _byObject.Remove(entity.Object);
+            if (!ReferenceEquals(entity.Object, null) && !ReferenceEquals(entity.Object, obj)) UnmapObject(entity.Object);
             entity.Object = obj;
             entity.Definition = d;
-            _byObject[obj] = d.Id;
+            entity.Remote = true;
+            MapObject(obj, d.Id);
             _pending.Remove(d.Id);
         }
 
-        private static GameObject FindInactiveSaved(Guid id)
+        private void BeginScans()
         {
-            InstanceID[] all = Resources.FindObjectsOfTypeAll<InstanceID>();
-            foreach (InstanceID instance in all)
+            _scanDepth++;
+        }
+
+        private void EndScans()
+        {
+            if (_scanDepth > 0 && --_scanDepth > 0) return;
+            _savedIndex.Clear();
+            _savedIndexValid = false;
+            _sceneTransforms = null;
+        }
+
+        private void ReleaseScans()
+        {
+            _savedIndex.Clear();
+            _savedIndexValid = false;
+            _sceneTransforms = null;
+            _sceneTransformPositions = null;
+        }
+
+        /// <summary>Finds a saved object the game's active-id table does not list, using one scene scan per message or retry pass.</summary>
+        private GameObject FindInactiveSaved(Guid id)
+        {
+            if (_scanDepth == 0) _savedIndexValid = false;
+            for (int pass = 0; pass < 2; pass++)
             {
-                if (instance == null || !instance.gameObject.scene.IsValid() || ReadSavedId(instance.gameObject) != id) continue;
-                if (s_instance != null) s_instance.BindResolved(id, instance.gameObject);
-                return instance.gameObject;
+                if (!_savedIndexValid) BuildSavedIndex();
+                if (!_savedIndex.TryGetValue(id, out GameObject obj)) return null;
+                if (obj != null && ReadSavedId(obj) == id)
+                {
+                    BindResolved(id, obj);
+                    return obj;
+                }
+                // The object was rebound or went away after the scan; look once more.
+                _savedIndexValid = false;
             }
             return null;
         }
 
-        private static GameObject FindRecipeDuplicate(Definition d)
+        private void BuildSavedIndex()
         {
-            Transform[] all = Resources.FindObjectsOfTypeAll<Transform>();
-            foreach (Transform candidate in all)
+            long started = PerfStats.Begin();
+            _savedIndex.Clear();
+            InstanceID[] all = Resources.FindObjectsOfTypeAll<InstanceID>();
+            foreach (InstanceID instance in all)
             {
+                if (instance == null) continue;
+                GameObject obj = instance.gameObject;
+                if (!obj.scene.IsValid()) continue;
+                Guid saved = ReadSavedId(obj);
+                if (saved != Guid.Empty && !_savedIndex.ContainsKey(saved)) _savedIndex.Add(saved, obj);
+            }
+            _savedIndexValid = true;
+            PerfStats.End("entity.scan", started);
+        }
+
+        private GameObject FindRecipeDuplicate(Definition d)
+        {
+            if (_scanDepth == 0) _sceneTransforms = null;
+            Transform[] all = _sceneTransforms;
+            Vector3[] positions = _sceneTransformPositions;
+            if (all == null)
+            {
+                long started = PerfStats.Begin();
+                all = _sceneTransforms = Resources.FindObjectsOfTypeAll<Transform>();
+                if (positions == null || positions.Length < all.Length)
+                    positions = _sceneTransformPositions = new Vector3[all.Length];
+                for (int i = 0; i < all.Length; i++)
+                    positions[i] = all[i] != null ? all[i].position : new Vector3(float.NaN, float.NaN, float.NaN);
+                PerfStats.End("entity.scan", started);
+            }
+            // Position first: it rejects nearly every candidate without reading (and allocating) its name.
+            float x = d.Position.x, y = d.Position.y, z = d.Position.z;
+            for (int i = 0; i < all.Length; i++)
+            {
+                float dx = positions[i].x - x, dy = positions[i].y - y, dz = positions[i].z - z;
+                if (!(dx * dx + dy * dy + dz * dz < 0.0001f)) continue;
+                Transform candidate = all[i];
                 if (candidate == null || !candidate.gameObject.scene.IsValid()) continue;
                 if (NormalizePrefabKey(candidate.name) != d.PrefabKey) continue;
                 if ((candidate.position - d.Position).sqrMagnitude < 0.0001f) return candidate.gameObject;
@@ -1119,8 +1429,16 @@ namespace PoECoop.Sync
 
         internal static string NormalizePrefabKey(string name)
         {
-            name = Protocol.Clean((name ?? "").Replace("(Clone)", ""), MaxPrefabKeyLength);
-            return Path.GetFileNameWithoutExtension(name).Trim().ToLowerInvariant();
+            if (name == null) name = "";
+            if (PrefabKeys.TryGetValue(name, out string cached)) return cached;
+            string key = Protocol.Clean(name.Replace("(Clone)", ""), MaxPrefabKeyLength);
+            key = Path.GetFileNameWithoutExtension(key).Trim().ToLowerInvariant();
+            if (name.Length <= MaxCachedPrefabKeyLength)
+            {
+                if (PrefabKeys.Count >= MaxCachedPrefabKeys) PrefabKeys.Clear();
+                PrefabKeys[name] = key;
+            }
+            return key;
         }
 
         private static bool ValidTransform(Vector3 position, Quaternion rotation, Vector3 scale)
