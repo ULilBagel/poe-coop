@@ -193,6 +193,15 @@ fi
 
 install_file "BepInEx/plugins/PoECoop/PoECoop.dll" "$plugin_dll"
 
+# The updater lives next to the game, so a later release is one command away.
+for updater in "$package_root/update-poecoop.sh" "$package_root/scripts/update-poecoop.sh"; do
+    if [ -f "$updater" ]; then
+        install_file "update-poecoop.sh" "$updater"
+        chmod +x "$game_dir/update-poecoop.sh"
+        break
+    fi
+done
+
 default_config="$game_dir/BepInEx/config/poecoop.cfg"
 if [ ! -e "$default_config" ]; then
     mkdir -p "$(dirname "$default_config")"
@@ -208,6 +217,9 @@ echo ""
 echo "PoE Co-op installed for $platform in: $game_dir"
 if [ -n "$backup_dir" ]; then
     echo "Replaced files were backed up in: $backup_dir"
+fi
+if [ -f "$game_dir/update-poecoop.sh" ]; then
+    echo "To update later, run: \"$game_dir/update-poecoop.sh\""
 fi
 if [ "$platform" = windows ]; then
     echo "For Proton, add this Steam launch option before playing:"

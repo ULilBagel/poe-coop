@@ -39,8 +39,10 @@ cp "$repo/tools/BepInEx_linux_x64_5.4.23.6.zip" "$package/bepinex/"
 cp "$repo/scripts/install-poecoop.sh" "$package/install-poecoop.sh"
 cp "$repo/scripts/install-poecoop.bat" "$package/install-poecoop.bat"
 cp "$repo/scripts/launch-poecoop.sh" "$package/launch-poecoop.sh"
+cp "$repo/scripts/update-poecoop.sh" "$package/update-poecoop.sh"
+cp "$repo/scripts/update-poecoop.bat" "$package/update-poecoop.bat"
 cp "$repo/INSTALL.md" "$package/INSTALL.md"
-chmod +x "$package/install-poecoop.sh" "$package/launch-poecoop.sh"
+chmod +x "$package/install-poecoop.sh" "$package/launch-poecoop.sh" "$package/update-poecoop.sh"
 
 artifact="$repo/dist/PoECoop-$version.zip"
 rm -f "$artifact"
@@ -49,4 +51,8 @@ if command -v sha256sum >/dev/null 2>&1; then
     (cd "$repo/dist" && sha256sum "PoECoop-$version.zip" > "PoECoop-$version.zip.sha256")
 fi
 
+# Standalone copies for the release page: players on a release without an updater start here.
+cp "$repo/scripts/update-poecoop.sh" "$repo/scripts/update-poecoop.bat" "$repo/dist/"
+
 echo "Created $artifact"
+echo "Upload to the release: PoECoop-$version.zip, PoECoop-$version.zip.sha256, update-poecoop.sh, update-poecoop.bat"

@@ -101,6 +101,30 @@ namespace PoECoop.Net
         public const int MaxNameLength = 24;
         public const int MaxChatLength = 300;
 
+        /// <summary>Where the current release and its updater live. Shown as text, so it has no scheme.</summary>
+        public const string UpdateUrl = "github.com/ULilBagel/poe-coop/releases/latest";
+
+        /// <summary>
+        /// One short sentence saying who has to update after a mod version mismatch. It goes into
+        /// the host's refusal, which older guests show as it is, so it stays well under 100 characters.
+        /// </summary>
+        public static string UpdateAdvice(string hostVersion, string guestVersion)
+        {
+            string who = "Both players need the same release";
+            System.Version host, guest;
+            if (TryVersion(hostVersion, out host) && TryVersion(guestVersion, out guest) && host != guest)
+                who = host > guest ? "The guest's version is older" : "The host's version is older";
+            return who + ". Run update-poecoop or get " + UpdateUrl;
+        }
+
+        private static bool TryVersion(string text, out System.Version version)
+        {
+            version = null;
+            if (string.IsNullOrEmpty(text)) return false;
+            try { version = new System.Version(text.Trim()); return true; }
+            catch (System.Exception) { return false; }
+        }
+
         public static string CleanName(string name)
         {
             name = Clean(name, MaxNameLength);

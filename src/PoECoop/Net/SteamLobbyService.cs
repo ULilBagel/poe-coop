@@ -689,7 +689,8 @@ namespace PoECoop.Net
             }
             if (!string.Equals(mod, _modVersion, StringComparison.Ordinal))
             {
-                reason = "Host mod version " + DisplayMetadata(mod) + " does not match local version " + _modVersion;
+                reason = "Host mod version " + DisplayMetadata(mod) + " does not match local version " + _modVersion
+                    + ". " + Protocol.UpdateAdvice(mod, _modVersion);
                 return false;
             }
             if (!string.Equals(game, _gameVersion, StringComparison.Ordinal))

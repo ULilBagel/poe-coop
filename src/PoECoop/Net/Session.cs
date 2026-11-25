@@ -498,7 +498,8 @@ namespace PoECoop.Net
 
             string refusal = null;
             if (protocol != Protocol.Version || modVersion != _modVersion)
-                refusal = "mod version differs: host has " + _modVersion + ", you have " + modVersion;
+                refusal = "mod version differs: host has " + _modVersion + ", you have " + modVersion
+                    + ". " + Protocol.UpdateAdvice(_modVersion, modVersion);
             else if (gameVersion != _gameVersion)
                 refusal = "game version differs: host has " + _gameVersion + ", you have " + gameVersion;
             if (refusal != null)
@@ -611,6 +612,16 @@ namespace PoECoop.Net
                 {
                     string reason = Protocol.Clean(reader.String(), 200);
                     Reset();
+                    // A host on an older release names the versions but not what to do about it.
+                    if (reason.StartsWith("mod version differs", StringComparison.Ordinal)
+                        && reason.IndexOf(Protocol.UpdateUrl, StringComparison.Ordinal) < 0)
+                    {
+                        const string marker = "host has ";
+                        int at = reason.IndexOf(marker, StringComparison.Ordinal);
+                        int comma = at < 0 ? -1 : reason.IndexOf(',', at);
+                        string hostVersion = comma < 0 ? null : reason.Substring(at + marker.Length, comma - at - marker.Length);
+                        reason += ". " + Protocol.UpdateAdvice(hostVersion, _modVersion);
+                    }
                     Status("Host refused the connection: " + reason);
                     break;
                 }

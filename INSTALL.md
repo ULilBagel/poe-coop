@@ -35,7 +35,7 @@ Proton requires one explicit Steam launch option so Wine loads BepInEx's `winhtt
 
    You can also launch through `./launch-poecoop.sh`, or `./launch-poecoop.sh -steam` for Steam mode. The launcher supplies the same visible Wine override and uses Steam on `PATH`, or `flatpak run com.valvesoftware.Steam` when Steam is installed through Flatpak.
 
-The installer only unpacks the official Windows x64 BepInEx 5.4.23.6 package and `PoECoop.dll` into the game folder. It does not edit `user.reg`, Steam settings, or launch options.
+The installer only unpacks the official Windows x64 BepInEx 5.4.23.6 package, `PoECoop.dll` and the updater (`update-poecoop.sh`) into the game folder. It does not edit `user.reg`, Steam settings, or launch options.
 
 ## Native Windows
 
@@ -92,9 +92,20 @@ Direct IP remains available for development or when Steam is unavailable.
 
 On a LAN, use the host's LAN address. Over the internet, the host normally needs to forward **TCP port 14242** to their PC and the guest uses the host's public IP. Only the host needs to forward the port. Firewall prompts must also allow the game to accept connections.
 
-## Updating or troubleshooting
+## Updating
 
-Extract the new release and run its installer again. Existing `BepInEx/config`, saves, and unrelated plugins are retained; only replaced files receive a new timestamped backup.
+Every player in a session needs the same release. When versions differ, the co-op window says which player is on the older one.
+
+The installer puts an updater in the game folder. It downloads the latest release from GitHub, checks it against the release's published SHA-256 when there is one, and runs that release's installer. `BepInEx/config`, saves, and unrelated plugins are retained; only replaced files receive a new timestamped backup.
+
+- **Linux and Proton:** run `./update-poecoop.sh` in the game folder.
+- **Windows:** double-click `update-poecoop.bat` in the game folder.
+
+If your release came without an updater (0.9.0), download `update-poecoop.sh` or `update-poecoop.bat` from the [latest release](https://github.com/ULilBagel/poe-coop/releases/latest) and run it once; from then on it is in the game folder. On Linux, pass the game folder if it is not found automatically: `sh update-poecoop.sh "/path/to/Pillars of Eternity"`.
+
+Updating by hand still works: extract the new release and run its installer again.
+
+## Troubleshooting
 
 To confirm the mod loaded, open `BepInEx/LogOutput.log` in the game folder and look for `PoE Co-op`. If Proton cannot find the game, pass its directory as the first argument to `./install-poecoop.sh`. Run `./install-poecoop.sh --help` for all installer options.
 
@@ -106,4 +117,4 @@ From the source repository, with a .NET SDK and `zip` installed:
 ./scripts/build-release.sh
 ```
 
-This builds the Release configuration and creates `dist/PoECoop-VERSION.zip`. The package contains only the plugin, both official BepInEx archives, installers, launcher, and these instructions. The build's automatic plugin deployment is redirected to a temporary folder, so it does not install into the real game.
+This builds the Release configuration and creates `dist/PoECoop-VERSION.zip` with its `.sha256`, and copies the two updaters into `dist/`. Upload all four files to the GitHub release: the updaters look for the zip and its checksum there, and players on a release without an updater download the updater from the same page. The package contains only the plugin, both official BepInEx archives, installers, updaters, launcher, and these instructions. The build's automatic plugin deployment is redirected to a temporary folder, so it does not install into the real game.
