@@ -4,7 +4,7 @@
     <AssemblyName>PoECoop</AssemblyName>
     <RootNamespace>PoECoop</RootNamespace>
     <LangVersion>latest</LangVersion>
-    <Version>0.10.0</Version>
+    <Version>0.10.1</Version>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <!-- Override on another PC: dotnet build -p:GameDir="..." or a PoECoop.csproj.user file -->
