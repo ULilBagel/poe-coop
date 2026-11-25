@@ -452,11 +452,13 @@ namespace PoECoop
         private static bool s_updateTraceTruncated;
         private static Ownership s_ownership;
         private static Orders s_orders;
+        private static Plugin s_plugin;
 
         public static void Start(MonoBehaviour runner, Session session, Ownership ownership, Orders orders)
         {
             s_ownership = ownership;
             s_orders = orders;
+            s_plugin = runner as Plugin;
             string[] args = Environment.GetCommandLineArgs();
             int interval = Array.IndexOf(args, "--coop-walk-interval");
             if (interval >= 0 && interval + 1 < args.Length) float.TryParse(args[interval + 1], out s_walkInterval);
@@ -673,7 +675,26 @@ namespace PoECoop
             Plugin.Log.LogInfo("TEST update stage " + stage + " " + Time.unscaledTime);
         }
 
+        /// <summary>
+        /// The same trace for a stage named after a message, such as "message-" plus
+        /// the type. The name is only built while the trace is running, so a caller on
+        /// the receive path pays for nothing in normal play.
+        /// </summary>
+        public static void UpdateTrace(string prefix, MessageType type)
+        {
+            if (!s_probeEnabled || Time.unscaledTime > s_updateTraceUntil) return;
+            UpdateTrace(prefix + type);
+        }
+
         public static void KeepRunningWhenHidden()
+        {
+            if (!s_probeEnabled && !s_multiInstance) return;
+            long perf = PerfStats.Begin();
+            KeepRunning();
+            PerfStats.End("devtools.update", perf);
+        }
+
+        private static void KeepRunning()
         {
             if (s_probeEnabled && GameState.IsLoading) s_updateTraceUntil = Time.unscaledTime + 15f;
             if (s_probeEnabled && Time.unscaledTime >= s_nextProbeHeartbeat)
@@ -798,6 +819,7 @@ namespace PoECoop
                 while (true)
                 {
                     yield return new WaitForSecondsRealtime(0.5f);
+                    long perf = PerfStats.Begin();
                     if (!InLevel || Camera.main == null)
                     {
                         if (SteamProbeRequested)
@@ -810,6 +832,8 @@ namespace PoECoop
                                 steam = SteamData(session)
                             });
                             ProbeTrace(session, "steam", ref trace, 14);
+                            PerfStats.End("devtools.probe", perf);
+                            PerfStats.Count("devtools.probe.frames");
                         }
                         if (Time.unscaledTime >= nextDiagnostic)
                         {
@@ -946,6 +970,8 @@ namespace PoECoop
                     ProbeTrace(session, "usables", ref trace, 12);
                     WriteProbeFrame(serializer, writer, frame);
                     ProbeTrace(session, "written", ref trace, 13);
+                    PerfStats.End("devtools.probe", perf);
+                    PerfStats.Count("devtools.probe.frames");
                 }
             }
         }
@@ -1015,15 +1041,17 @@ namespace PoECoop
         private const int MaxProbeSteamValues = 256;
         private const int MaxProbeSteamCollectionValues = 32;
 
-        private static bool SteamProbeRequested =>
-            Array.IndexOf(Environment.GetCommandLineArgs(), "-steam") >= 0
+        private static readonly bool s_steamArgument =
+            Array.IndexOf(Environment.GetCommandLineArgs(), "-steam") >= 0;
+
+        private static readonly bool SteamProbeRequested = s_steamArgument
             || Array.IndexOf(Environment.GetCommandLineArgs(), "--coop-steam-lobby") >= 0;
 
         private static ProbeSteamState SteamData(Session session)
         {
             ProbeSteamState data = new ProbeSteamState
             {
-                requested = Array.IndexOf(Environment.GetCommandLineArgs(), "-steam") >= 0,
+                requested = s_steamArgument,
                 sessionPlayerCount = session != null ? session.Players.Count : 0
             };
             ProbeFeatureContext runtime = ProbeFeatureContext.Create(
@@ -3092,7 +3120,8 @@ namespace PoECoop
         {
             object instance = NamedValue(syncType, null, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic, new[] { "Instance", "Current", "Singleton" });
             if (instance != null && syncType.IsInstanceOfType(instance)) return instance;
-            Plugin[] plugins = UnityEngine.Object.FindObjectsOfType<Plugin>();
+            // The plugin component never changes, so the scene is only searched if Start did not get it.
+            Plugin[] plugins = s_plugin != null ? new[] { s_plugin } : UnityEngine.Object.FindObjectsOfType<Plugin>();
             foreach (Plugin plugin in plugins)
             {
                 for (Type type = plugin.GetType(); type != null; type = type.BaseType)

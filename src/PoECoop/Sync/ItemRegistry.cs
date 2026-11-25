@@ -17,6 +17,8 @@ namespace PoECoop.Sync
         private const int MaxNameLength = 256;
         private const int MaxCounter = 1000000;
         private const float MaxProgress = 1000000000f;
+        private const float PruneInterval = 0.5f;
+        private const int MaxCachedKeys = 4096;
 
         private static readonly AccessTools.FieldRef<InstanceID, Guid> StoredId =
             AccessTools.FieldRefAccess<InstanceID, Guid>("m_Guid");
@@ -38,14 +40,21 @@ namespace PoECoop.Sync
             AccessTools.FieldRefAccess<EquipmentSoulbind, DatabaseString>("<CachedBoundOwnerName>k__BackingField");
         private static readonly AccessTools.FieldRef<EquipmentSoulbind, string> SoulbindCachedOverride =
             AccessTools.FieldRefAccess<EquipmentSoulbind, string>("<CachedBoundOwnerOverrideName>k__BackingField");
+        private static readonly AccessTools.FieldRef<Item, bool> Initted =
+            AccessTools.FieldRefAccess<Item, bool>("m_Initted");
 
         private static ItemRegistry s_instance;
+        // Asset names never change, and reading UnityEngine.Object.name allocates a string every time.
+        private static readonly Dictionary<UnityEngine.Object, string> s_keys = new Dictionary<UnityEngine.Object, string>();
+        private static readonly Dictionary<Guid, Item> s_savedIndex = new Dictionary<Guid, Item>();
+        private static int s_savedIndexFrame = -1;
 
         private readonly Session _session;
         private readonly Dictionary<Guid, Item> _byId = new Dictionary<Guid, Item>();
         private readonly Dictionary<Item, Guid> _byItem = new Dictionary<Item, Guid>();
         private readonly HashSet<Guid> _remoteCreated = new HashSet<Guid>();
         private long _generation;
+        private float _nextPrune;
 
         internal sealed class Recipe
         {
@@ -90,6 +99,7 @@ namespace PoECoop.Sync
             _byId.Clear();
             _byItem.Clear();
             _remoteCreated.Clear();
+            ClearCaches();
         }
 
         public void Update(float now)
@@ -100,7 +110,11 @@ namespace PoECoop.Sync
                 _byId.Clear();
                 _byItem.Clear();
                 _remoteCreated.Clear();
+                ClearCaches();
             }
+            // Every reader of these maps tolerates a destroyed item, so pruning does not need to run each frame.
+            if (now < _nextPrune) return;
+            _nextPrune = now + PruneInterval;
             List<Item> destroyed = null;
             foreach (Item item in _byItem.Keys)
                 if (item == null) (destroyed ?? (destroyed = new List<Item>())).Add(item);
@@ -140,15 +154,212 @@ namespace PoECoop.Sync
             return item;
         }
 
+        /// <summary>The live item already bound to this id, without the saved-object fallbacks of Resolve.</summary>
+        internal static Item Known(Guid id)
+        {
+            ItemRegistry self = s_instance;
+            return id != Guid.Empty && self != null && self._byId.TryGetValue(id, out Item item) && item != null ? item : null;
+        }
+
+        /// <summary>NormalizeKey(asset.name), cached per asset.</summary>
+        internal static string KeyOf(UnityEngine.Object asset)
+        {
+            if (asset == null) return "";
+            if (s_keys.TryGetValue(asset, out string key)) return key;
+            key = NormalizeKey(asset.name);
+            if (s_keys.Count >= MaxCachedKeys) s_keys.Clear();
+            s_keys[asset] = key;
+            return key;
+        }
+
+        private static string PrefabKeyOf(Item item)
+        {
+            // Item.Prefab answers the item itself when it has no prefab; only real assets are cached.
+            Item prefab = item.Prefab;
+            return prefab != null && !ReferenceEquals(prefab, item) ? KeyOf(prefab) : NormalizeKey(item.name);
+        }
+
+        internal static ulong Mix(ulong hash, ulong value)
+        {
+            hash = (hash ^ value) * 0x9E3779B97F4A7C15UL;
+            return hash ^ (hash >> 32);
+        }
+
+        internal static ulong Mix(ulong hash, Guid value)
+        {
+            var bits = new GuidBits { Value = value };
+            return Mix(Mix(hash, bits.Low), bits.High);
+        }
+
+        internal static ulong Mix(ulong hash, float value)
+        {
+            var bits = new FloatBits { Value = value };
+            return Mix(hash, bits.Bits);
+        }
+
+        internal static ulong Mix(ulong hash, string value)
+        {
+            return Mix(hash, value != null ? (ulong)(uint)value.GetHashCode() + ((ulong)value.Length << 32) : ulong.MaxValue);
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit)]
+        private struct GuidBits
+        {
+            [System.Runtime.InteropServices.FieldOffset(0)] internal Guid Value;
+            [System.Runtime.InteropServices.FieldOffset(0)] internal ulong Low;
+            [System.Runtime.InteropServices.FieldOffset(8)] internal ulong High;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit)]
+        private struct FloatBits
+        {
+            [System.Runtime.InteropServices.FieldOffset(0)] internal float Value;
+            [System.Runtime.InteropServices.FieldOffset(0)] internal uint Bits;
+        }
+
+        /// <summary>
+        /// Folds everything Capture would put into a recipe into the hash without allocating. Returns false,
+        /// leaving the hash untouched, exactly when Capture would return null.
+        /// </summary>
+        internal static bool MixState(Item item, ref ulong hash)
+        {
+            Guid id = NetworkId(item);
+            if (id == Guid.Empty || item == null) return false;
+            string prefabKey = PrefabKeyOf(item);
+            if (prefabKey.Length == 0) return false;
+            ulong h = Mix(Mix(hash, id), prefabKey);
+
+            Consumable consumable = item as Consumable;
+            if (consumable != null) h = Mix(Mix(Mix(h, 1UL), (ulong)UsageCounter(consumable)), (ulong)consumable.Level);
+
+            Equippable equippable = item as Equippable;
+            if (equippable != null)
+            {
+                h = Mix(h, equippable.HasAddedPrefabMods ? 3UL : 2UL);
+                List<ItemModComponent> attached = equippable.AttachedItemMods;
+                int mods = 0;
+                for (int i = 0; attached != null && i < attached.Count; i++)
+                {
+                    ItemModComponent component = attached[i];
+                    if (component == null || component.Mod == null || mods >= MaxMods) continue;
+                    mods++;
+                    GenericAbility ability = component.ChargeAbility;
+                    h = Mix(Mix(h, KeyOf(component.Mod)), (ulong)(ability != null ? AbilityCooldownCounter(ability) : 0));
+                }
+                h = Mix(h, (ulong)mods);
+            }
+
+            Grimoire grimoire = item.GetComponent<Grimoire>();
+            if (grimoire != null)
+            {
+                h = Mix(Mix(h, 4UL), grimoire.PrimaryOwnerName);
+                if (grimoire.Spells != null)
+                {
+                    for (int chapter = 0; chapter < grimoire.Spells.Length && chapter < Grimoire.MaxSpellLevel; chapter++)
+                    {
+                        Grimoire.SpellChapter spellChapter = grimoire.Spells[chapter];
+                        for (int slot = 0; slot < Grimoire.MaxSpellsPerLevel; slot++)
+                        {
+                            GenericSpell spell = spellChapter != null && spellChapter.SpellData != null
+                                && slot < spellChapter.SpellData.Length ? spellChapter.SpellData[slot] : null;
+                            h = Mix(h, spell != null ? KeyOf(spell) : "");
+                        }
+                    }
+                }
+            }
+
+            EquipmentSoulbind soulbind = item.GetComponent<EquipmentSoulbind>();
+            if (soulbind != null)
+            {
+                h = Mix(Mix(Mix(h, 5UL), soulbind.BoundGuid), (ulong)soulbind.UnlockLevel);
+                h = Mix(Mix(h, soulbind.UnlockProgress), soulbind.DegenerateUnlockProgress);
+                h = Mix(Mix(h, soulbind.WasLastUnlockDegenerate ? 1UL : 0UL), (ulong)(int)soulbind.BoundClass);
+                DatabaseString name = soulbind.CachedBoundOwnerName;
+                h = Mix(Mix(h, (ulong)(name != null ? name.StringTableID : -1)), (ulong)(name != null ? name.StringID : -1));
+                h = Mix(h, soulbind.CachedBoundOwnerOverrideName);
+            }
+            hash = h;
+            return true;
+        }
+
+        /// <summary>
+        /// True when applying the recipe to this live item would change nothing, so the caller may skip it.
+        /// Mirrors ApplyRecipe field by field; any doubt answers false.
+        /// </summary>
+        internal static bool Matches(Item item, Recipe recipe)
+        {
+            if (item == null || recipe == null) return false;
+            if (recipe.HasConsumable && item is Consumable consumable
+                && (UsageCounter(consumable) != recipe.ConsumableUsage || consumable.Level != recipe.ConsumableLevel)) return false;
+            if (recipe.HasEquippable && item is Equippable equippable)
+            {
+                List<ItemModComponent> attached = equippable.AttachedItemMods;
+                if (!Initted(equippable) || attached == null
+                    || equippable.HasAddedPrefabMods != (recipe.HasAddedPrefabMods || recipe.Mods.Length > 0)) return false;
+                for (int i = 0; i < attached.Count; i++)
+                {
+                    ItemModComponent component = attached[i];
+                    if (component == null || component.Mod == null) continue;
+                    if (Array.IndexOf(recipe.Mods, KeyOf(component.Mod)) < 0) return false;
+                }
+                for (int i = 0; i < recipe.Mods.Length; i++)
+                {
+                    ItemModComponent component = FindMod(equippable, recipe.Mods[i]);
+                    if (component == null) return false;
+                    GenericAbility ability = component.ChargeAbility;
+                    if (ability != null && AbilityCooldownCounter(ability) != recipe.ModCounters[i]) return false;
+                }
+            }
+            if (recipe.HasGrimoire)
+            {
+                Grimoire grimoire = item.GetComponent<Grimoire>();
+                if (grimoire != null)
+                {
+                    if (!string.Equals(grimoire.PrimaryOwnerName, recipe.GrimoireOwner, StringComparison.Ordinal)
+                        || grimoire.Spells == null || grimoire.Spells.Length != Grimoire.MaxSpellLevel
+                        || recipe.Spells.Length != MaxGrimoireSpells) return false;
+                    for (int chapter = 0; chapter < Grimoire.MaxSpellLevel; chapter++)
+                    {
+                        Grimoire.SpellChapter spellChapter = grimoire.Spells[chapter];
+                        if (spellChapter == null || spellChapter.SpellData == null
+                            || spellChapter.SpellData.Length != Grimoire.MaxSpellsPerLevel) return false;
+                        for (int slot = 0; slot < Grimoire.MaxSpellsPerLevel; slot++)
+                        {
+                            GenericSpell spell = spellChapter.SpellData[slot];
+                            string key = recipe.Spells[chapter * Grimoire.MaxSpellsPerLevel + slot];
+                            if (key.Length == 0 ? !ReferenceEquals(spell, null) : spell == null || KeyOf(spell) != key) return false;
+                        }
+                    }
+                }
+            }
+            if (recipe.HasSoulbind)
+            {
+                EquipmentSoulbind soulbind = item.GetComponent<EquipmentSoulbind>();
+                if (soulbind != null)
+                {
+                    DatabaseString name = soulbind.CachedBoundOwnerName;
+                    if (soulbind.BoundGuid != recipe.BoundActor || soulbind.UnlockLevel != recipe.UnlockLevel
+                        || soulbind.UnlockProgress != recipe.UnlockProgress
+                        || soulbind.DegenerateUnlockProgress != recipe.DegenerateProgress
+                        || soulbind.WasLastUnlockDegenerate != recipe.LastUnlockDegenerate
+                        || (int)soulbind.BoundClass != recipe.BoundClass
+                        || (recipe.CachedNameTable < 0 ? name != null : name == null
+                            || name.StringTableID != recipe.CachedNameTable || name.StringID != recipe.CachedNameId)
+                        || !string.Equals(soulbind.CachedBoundOwnerOverrideName, recipe.CachedOwnerOverride, StringComparison.Ordinal))
+                        return false;
+                }
+            }
+            return true;
+        }
+
         internal static Recipe Capture(Item item)
         {
             Guid id = NetworkId(item);
             if (id == Guid.Empty || item == null) return null;
-            Item prefab = item.Prefab != null ? item.Prefab : item;
             var recipe = new Recipe
             {
                 Id = id,
-                PrefabKey = NormalizeKey(prefab.name),
+                PrefabKey = PrefabKeyOf(item),
             };
 
             Consumable consumable = item as Consumable;
@@ -169,7 +380,7 @@ namespace PoECoop.Sync
                 foreach (ItemModComponent component in equippable.AttachedItemMods)
                 {
                     if (component == null || component.Mod == null || mods.Count >= MaxMods) continue;
-                    mods.Add(NormalizeKey(component.Mod.name));
+                    mods.Add(KeyOf(component.Mod));
                     GenericAbility ability = component.ChargeAbility;
                     counters.Add(ability != null ? AbilityCooldownCounter(ability) : 0);
                 }
@@ -192,7 +403,7 @@ namespace PoECoop.Sync
                         {
                             GenericSpell spell = spellChapter != null && spellChapter.SpellData != null
                                 && slot < spellChapter.SpellData.Length ? spellChapter.SpellData[slot] : null;
-                            spells.Add(spell != null ? NormalizeKey(spell.name) : "");
+                            spells.Add(spell != null ? KeyOf(spell) : "");
                         }
                     }
                 }
@@ -337,7 +548,7 @@ namespace PoECoop.Sync
             Item item = Resolve(recipe.Id);
             if (item != null)
             {
-                ApplyRecipe(item, recipe);
+                if (!Matches(item, recipe)) ApplyRecipe(item, recipe);
                 return item;
             }
             ItemRegistry self = s_instance;
@@ -374,8 +585,7 @@ namespace PoECoop.Sync
                     {
                         ItemModComponent attached = equippable.AttachedItemMods[i];
                         if (attached == null || attached.Mod == null) continue;
-                        string key = NormalizeKey(attached.Mod.name);
-                        if (!wanted.Contains(key)) equippable.DestroyItemMod(attached);
+                        if (!wanted.Contains(KeyOf(attached.Mod))) equippable.DestroyItemMod(attached);
                     }
                     for (int i = 0; i < recipe.Mods.Length; i++)
                     {
@@ -444,7 +654,7 @@ namespace PoECoop.Sync
         private static ItemModComponent FindMod(Equippable item, string key)
         {
             foreach (ItemModComponent component in item.AttachedItemMods)
-                if (component != null && component.Mod != null && NormalizeKey(component.Mod.name) == key) return component;
+                if (component != null && component.Mod != null && KeyOf(component.Mod) == key) return component;
             return null;
         }
 
@@ -486,15 +696,35 @@ namespace PoECoop.Sync
             if (ReadSavedId(item) != id) instance.Guid = id;
         }
 
+        /// <summary>
+        /// Finds a saved item that is not in the game's active id table. The scan of every loaded item is
+        /// shared by all lookups of one frame; a manifest of unknown items used to pay for it once per item.
+        /// </summary>
         private static Item FindInactiveSaved(Guid id)
         {
-            Item[] all = Resources.FindObjectsOfTypeAll<Item>();
-            foreach (Item item in all)
+            int frame = Time.frameCount;
+            if (s_savedIndexFrame != frame)
             {
-                if (item == null || item.IsPrefab || !item.gameObject.scene.IsValid()) continue;
-                if (ReadSavedId(item) == id) return item;
+                long started = PerfStats.Begin();
+                s_savedIndexFrame = frame;
+                s_savedIndex.Clear();
+                Item[] all = Resources.FindObjectsOfTypeAll<Item>();
+                foreach (Item item in all)
+                {
+                    if (item == null || item.IsPrefab || !item.gameObject.scene.IsValid()) continue;
+                    Guid saved = ReadSavedId(item);
+                    if (saved != Guid.Empty && !s_savedIndex.ContainsKey(saved)) s_savedIndex[saved] = item;
+                }
+                PerfStats.End("inventory.scan", started);
             }
-            return null;
+            return s_savedIndex.TryGetValue(id, out Item found) && found != null ? found : null;
+        }
+
+        private static void ClearCaches()
+        {
+            s_keys.Clear();
+            s_savedIndex.Clear();
+            s_savedIndexFrame = -1;
         }
 
         private static Guid ReadSavedId(Item item)
@@ -508,6 +738,7 @@ namespace PoECoop.Sync
 
         private void OnLevelChanged(object sender, EventArgs e)
         {
+            ClearCaches();
             List<Guid> missing = null;
             foreach (var pair in _byId)
                 if (pair.Value == null) (missing ?? (missing = new List<Guid>())).Add(pair.Key);

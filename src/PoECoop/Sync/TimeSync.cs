@@ -26,6 +26,8 @@ namespace PoECoop.Sync
 
         private const float SendInterval = 0.1f;
         private const float FullRefreshInterval = 2f;
+        /// <summary>Keeps the periodic refresh out of the frame other streams refresh in after a forced one.</summary>
+        private const float ForcedRefreshPhase = 0.3f;
         private const float MaxTimeScale = 16f;
         private const int MaxPendingRequests = 64;
         private const int MaxCachedResultsPerPlayer = 256;
@@ -44,8 +46,7 @@ namespace PoECoop.Sync
             AccessTools.FieldRefAccess<TimeController, float>("m_TimeScale");
         private static readonly MethodInfo TimeScaleSetter =
             AccessTools.PropertySetter(typeof(TimeController), "TimeScale");
-        private static readonly MethodInfo UpdateDayNightCycle =
-            AccessTools.Method(typeof(WorldTime), "UpdateDayNightCycle");
+        private static readonly Action<WorldTime> UpdateDayNightCycle = DayNightDelegate();
 
         [ThreadStatic]
         private static int s_applyDepth;
@@ -169,7 +170,11 @@ namespace PoECoop.Sync
             if (self == null) return;
             self.SyncContext();
             if (self._session.IsHost && self._worldReady && self.CanCapture()
-                && (playerId < 0 || self._session.IsPeerReady(playerId))) self.SendSnapshot(playerId);
+                && (playerId < 0 || self._session.IsPeerReady(playerId)))
+            {
+                self.SendSnapshot(playerId);
+                self._nextFullRefresh = Time.unscaledTime + FullRefreshInterval + ForcedRefreshPhase;
+            }
         }
 
         public static bool RequestPause(bool paused)
@@ -227,19 +232,51 @@ namespace PoECoop.Sync
             SyncContext();
             if (_session.IsHost)
             {
-                if (_barrierPaused && TimeController.Instance != null) Time.timeScale = 0f;
-                if (!_worldReady || _session.Players.Count < 2 || !CanCapture() || now < _nextSend) return;
-                _nextSend = now + SendInterval;
-                bool full = now >= _nextFullRefresh;
-                if (full) _nextFullRefresh = now + FullRefreshInterval;
-                Snapshot snapshot = Capture();
-                if (!full && _hasSent && Same(_sent, snapshot)) return;
-                SendSnapshot(0);
+                if (_barrierPaused && TimeController.Instance != null) SetTimeScale(0f);
+                if (!_worldReady || _session.Players.Count < 2 || !CanCapture()) return;
+                long started = PerfStats.Begin();
+                HostTick(now);
+                PerfStats.End("time.capture", started);
             }
             else if (_session.IsGuest)
             {
+                long started = PerfStats.Begin();
                 ApplyGuestSnapshot();
+                PerfStats.End("time.update", started);
             }
+        }
+
+        /// <summary>
+        /// The clock goes out on the 10 Hz tick. A pause or speed change goes out in the
+        /// frame it happens, so guests do not keep simulating for up to a tick after it.
+        /// </summary>
+        private void HostTick(float now)
+        {
+            Snapshot snapshot = Capture();
+            bool due = now >= _nextSend;
+            if (!due)
+            {
+                if (!_hasSent || SameControl(_sent, snapshot)) return;
+                PerfStats.Count("time.immediate");
+            }
+            else
+            {
+                bool full = now >= _nextFullRefresh;
+                if (full)
+                {
+                    // A refresh time of zero means a reset asked for this one.
+                    _nextFullRefresh = now + FullRefreshInterval + (_nextFullRefresh <= 0f ? ForcedRefreshPhase : 0f);
+                    PerfStats.Count("time.full");
+                }
+                else if (_hasSent && Same(_sent, snapshot))
+                {
+                    _nextSend = now + SendInterval;
+                    PerfStats.Count("time.skipped");
+                    return;
+                }
+            }
+            _nextSend = now + SendInterval;
+            SendSnapshot(0, snapshot);
         }
 
         private void SyncContext()
@@ -258,7 +295,7 @@ namespace PoECoop.Sync
             _barrierPaused = barrier;
             _nextSend = 0f;
             _nextFullRefresh = 0f;
-            if (_session.IsHost && barrier && TimeController.Instance != null) Time.timeScale = 0f;
+            if (_session.IsHost && barrier && TimeController.Instance != null) SetTimeScale(0f);
             else if (_session.IsGuest) ApplyGuestSnapshot();
         }
 
@@ -340,6 +377,12 @@ namespace PoECoop.Sync
 
         private long SendSnapshot(int targetPlayerId)
         {
+            if (_sequence == long.MaxValue) return SendSnapshot(targetPlayerId, default(Snapshot));
+            return SendSnapshot(targetPlayerId, Capture());
+        }
+
+        private long SendSnapshot(int targetPlayerId, Snapshot snapshot)
+        {
             if (_sequence == long.MaxValue)
             {
                 if (!_sequenceExhaustedLogged)
@@ -350,14 +393,21 @@ namespace PoECoop.Sync
                 return _sequence;
             }
 
-            Snapshot snapshot = Capture();
             long next = _sequence + 1;
             byte[] data = Serialize(_worldEpoch, next, snapshot);
-            if (targetPlayerId < 0 || targetPlayerId == Session.HostId) _session.SendToGuests(data);
-            else _session.SendToPlayer(targetPlayerId, data);
             _sequence = next;
-            _sent = snapshot;
-            _hasSent = true;
+            PerfStats.Count("time.records");
+            if (targetPlayerId < 0 || targetPlayerId == Session.HostId)
+            {
+                _session.SendToGuests(data);
+                _sent = snapshot;
+                _hasSent = true;
+            }
+            else
+            {
+                // Only that guest has it, so the change check still compares with the last broadcast.
+                _session.SendToPlayer(targetPlayerId, data);
+            }
             return next;
         }
 
@@ -391,6 +441,7 @@ namespace PoECoop.Sync
             if (epoch != _worldEpoch) return;
             if (epoch == _guestEpoch && sequence <= _guestSequence) return;
 
+            long started = PerfStats.Begin();
             _guestEpoch = epoch;
             _guestSequence = sequence;
             _guestSnapshot = new Snapshot
@@ -405,6 +456,7 @@ namespace PoECoop.Sync
             };
             _hasGuestSnapshot = true;
             ApplyGuestSnapshot();
+            PerfStats.End("time.apply", started);
         }
 
         private void ApplyGuestSnapshot()
@@ -428,7 +480,7 @@ namespace PoECoop.Sync
                 }
                 ApplyWorldClock(snapshot);
             }
-            Time.timeScale = GuestEffectiveTimeScale(time);
+            SetTimeScale(GuestEffectiveTimeScale(time));
         }
 
         private void ApplyWorldClock(Snapshot snapshot)
@@ -441,7 +493,7 @@ namespace PoECoop.Sync
                 world.AdventureStart = new EternityDateTime(snapshot.AdventureStart);
             if (world.TimeSpentTravelling == null || world.TimeSpentTravelling.TotalSeconds() != snapshot.Travel)
                 world.TimeSpentTravelling = new EternityTimeInterval(snapshot.Travel);
-            if (changed) UpdateDayNightCycle.Invoke(world, null);
+            if (changed && UpdateDayNightCycle != null) UpdateDayNightCycle(world);
         }
 
         private float GuestEffectiveTimeScale(TimeController time)
@@ -457,14 +509,30 @@ namespace PoECoop.Sync
             if (self == null || !self._session.IsGuest || !Plugin.IsMirroring) return false;
             TimeController time = TimeController.Instance;
             if (time == null) return false;
-            Time.timeScale = self.GuestEffectiveTimeScale(time);
+            SetTimeScale(self.GuestEffectiveTimeScale(time));
             return true;
         }
 
         internal static void OnHostTimeScaleUpdated()
         {
             TimeSync self = s_instance;
-            if (self != null && self._session.IsHost && self._barrierPaused) Time.timeScale = 0f;
+            if (self != null && self._session.IsHost && self._barrierPaused) SetTimeScale(0f);
+        }
+
+        /// <summary>Writes the engine timescale only when it differs, and counts the real changes.</summary>
+        private static void SetTimeScale(float value)
+        {
+            if (Time.timeScale == value) return;
+            Time.timeScale = value;
+            PerfStats.Count("time.timescale");
+        }
+
+        private static Action<WorldTime> DayNightDelegate()
+        {
+            MethodInfo method = AccessTools.Method(typeof(WorldTime), "UpdateDayNightCycle");
+            return method != null
+                ? (Action<WorldTime>)Delegate.CreateDelegate(typeof(Action<WorldTime>), method)
+                : null;
         }
 
         private void ClearGuestSnapshot(bool restoreNative)
@@ -615,8 +683,14 @@ namespace PoECoop.Sync
 
         private static bool Same(Snapshot a, Snapshot b)
         {
-            return a.Flags == b.Flags && a.Current == b.Current && a.AdventureStart == b.AdventureStart
-                && a.Travel == b.Travel && Mathf.Approximately(a.SelectedRtwP, b.SelectedRtwP)
+            return a.Current == b.Current && a.AdventureStart == b.AdventureStart
+                && a.Travel == b.Travel && SameControl(a, b);
+        }
+
+        /// <summary>Pause, turn lock and speed: everything except the world clock.</summary>
+        private static bool SameControl(Snapshot a, Snapshot b)
+        {
+            return a.Flags == b.Flags && Mathf.Approximately(a.SelectedRtwP, b.SelectedRtwP)
                 && Mathf.Approximately(a.Tactical, b.Tactical) && Mathf.Approximately(a.Effective, b.Effective);
         }
 

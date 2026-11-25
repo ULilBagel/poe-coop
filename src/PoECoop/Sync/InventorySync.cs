@@ -17,9 +17,15 @@ namespace PoECoop.Sync
         private const int MaxEquipmentSlots = 13;
         private const int MaxWeaponSets = EquipmentSet.MAX_WEAPON_SETS;
         private const int MaxCurrency = 1000000000;
+        private const ulong HashSeed = 14695981039346656037UL;
         private const float SendInterval = 0.1f;
         private const float FullRefreshInterval = 3f;
         private const float RetryInterval = 0.25f;
+        private const float MaxRetryInterval = 2f;
+        private const float DiscoverInterval = 0.1f;
+        private const float FallbackScanInterval = 0.5f;
+        // Added once after a forced refresh so this stream's next integrity pass misses the other streams'.
+        private const float ForcedRefreshPhase = 2.25f;
         private static readonly MessageType InventoryStateMessage = (MessageType)42;
         private static readonly MessageType EquipmentStateMessage = (MessageType)43;
 
@@ -42,6 +48,10 @@ namespace PoECoop.Sync
         private static readonly AccessTools.FieldRef<Equippable, Equippable.EquipmentSlot> ItemSlot =
             AccessTools.FieldRefAccess<Equippable, Equippable.EquipmentSlot>("m_equipped_slot");
 
+        // The game's own registry of started containers; reading it replaces a scene scan.
+        private static readonly System.Reflection.FieldInfo AllContainers =
+            AccessTools.Field(typeof(Container), "s_AllContainers");
+
         private static InventorySync s_instance;
         private static int s_applyDepth;
 
@@ -54,7 +64,9 @@ namespace PoECoop.Sync
             internal int Revision;
             internal Guid MutationGroup;
             internal bool Dirty;
-            internal string Fingerprint = "";
+            internal bool HasHash;
+            internal ulong Hash;
+            internal float RefreshAt;
         }
 
         private sealed class TrackedEquipment
@@ -64,7 +76,9 @@ namespace PoECoop.Sync
             internal int Revision;
             internal Guid MutationGroup;
             internal bool Dirty;
-            internal string Fingerprint = "";
+            internal bool HasHash;
+            internal ulong Hash;
+            internal float RefreshAt;
         }
 
         private sealed class ItemRecord
@@ -100,6 +114,10 @@ namespace PoECoop.Sync
             internal int Revision;
             internal Guid MutationGroup;
             internal readonly Dictionary<int, InventoryPage> Pages = new Dictionary<int, InventoryPage>();
+            internal List<ItemRecord> Records;
+            internal bool Costly;
+            internal float Delay;
+            internal float NextAttempt;
         }
 
         private sealed class EquipmentRecord
@@ -113,6 +131,9 @@ namespace PoECoop.Sync
             internal Guid[] Slots;
             internal Guid[] Weapons;
             internal List<ItemRegistry.Recipe> Recipes;
+            internal bool Costly;
+            internal float Delay;
+            internal float NextAttempt;
         }
 
         private readonly Session _session;
@@ -125,6 +146,17 @@ namespace PoECoop.Sync
         private readonly Dictionary<Guid, int> _appliedEquipment = new Dictionary<Guid, int>();
         private readonly Dictionary<NPCAppearance, float> _appearanceAt = new Dictionary<NPCAppearance, float>();
         private readonly HashSet<Guid> _possiblyRemoved = new HashSet<Guid>();
+        private readonly HashSet<BaseInventory> _uiInventories = new HashSet<BaseInventory>();
+        private readonly HashSet<Guid> _scratchIds = new HashSet<Guid>();
+        private readonly List<ItemRecord> _scratchRecords = new List<ItemRecord>();
+        private readonly List<Guid> _scratchSlots = new List<Guid>();
+        private readonly List<Guid> _scratchWeapons = new List<Guid>();
+        private readonly List<ItemRegistry.Recipe> _scratchRecipes = new List<ItemRegistry.Recipe>();
+        private readonly List<KeyValuePair<Guid, InventoryAssembly>> _scratchAssemblies = new List<KeyValuePair<Guid, InventoryAssembly>>();
+        private readonly List<EquipmentRecord> _scratchEquipment = new List<EquipmentRecord>();
+        private readonly List<Guid> _scratchDead = new List<Guid>();
+        private readonly Dictionary<Equippable, Equippable.EquipmentSlot> _expectedSlots =
+            new Dictionary<Equippable, Equippable.EquipmentSlot>();
         private long _generation;
         private long _worldEpoch;
         private bool _worldReady;
@@ -132,9 +164,12 @@ namespace PoECoop.Sync
         private int _mutationDepth;
         private Guid _activeMutation;
         private float _nextSend;
-        private float _nextFullRefresh;
+        private bool _forceFull = true;
         private float _nextRetry;
         private float _nextCleanup;
+        private float _nextDiscover;
+        private float _nextFallbackScan;
+        private int _discoverFrame = -1;
 
         public InventorySync(Session session, Ownership ownership)
         {
@@ -178,6 +213,7 @@ namespace PoECoop.Sync
             _appliedEquipment.Clear();
             _appearanceAt.Clear();
             _possiblyRemoved.Clear();
+            _uiInventories.Clear();
         }
 
         /// <summary>Called by FlowCoordinator for WorldReady, world reset, and readiness barriers.</summary>
@@ -199,20 +235,20 @@ namespace PoECoop.Sync
                     tracked.Revision = 0;
                     tracked.MutationGroup = Guid.Empty;
                     tracked.Dirty = true;
-                    tracked.Fingerprint = "";
+                    tracked.HasHash = false;
                 }
                 foreach (TrackedEquipment tracked in _equipment.Values)
                 {
                     tracked.Revision = 0;
                     tracked.MutationGroup = Guid.Empty;
                     tracked.Dirty = true;
-                    tracked.Fingerprint = "";
+                    tracked.HasHash = false;
                 }
             }
             if (!epochChanged && _worldReady == ready) return;
             _worldReady = ready;
             _nextSend = 0f;
-            _nextFullRefresh = 0f;
+            _forceFull = true;
             Plugin.Log.LogInfo("Inventory world state epoch=" + _worldEpoch + " ready=" + _worldReady);
         }
 
@@ -226,31 +262,42 @@ namespace PoECoop.Sync
                 _appliedInventories.Clear();
                 _appliedEquipment.Clear();
                 _possiblyRemoved.Clear();
+                _uiInventories.Clear();
                 _worldReady = false;
                 _worldEpoch = 0;
                 _nextSend = 0f;
+                _nextDiscover = 0f;
             }
             if (!_session.IsHost && !_session.IsGuest) return;
 
-            DiscoverModel();
+            // New inventories only matter to the next send or apply; ResolveInventory and RequestResync
+            // still discover on demand.
+            if (now >= _nextDiscover)
+            {
+                _nextDiscover = now + DiscoverInterval;
+                DiscoverModel();
+            }
             if (_session.IsGuest)
             {
+                long started = PerfStats.Begin();
                 if (now >= _nextRetry)
                 {
                     _nextRetry = now + RetryInterval;
-                    RetryPending();
+                    RetryPending(now);
                     UpdateAppearance(now);
                 }
                 if (_possiblyRemoved.Count > 0 && now >= _nextCleanup) CleanupRemoved();
+                FlushUi();
+                PerfStats.End("inventory.update", started);
                 return;
             }
             if (!_worldReady || _worldEpoch <= 0 || _session.Players.Count < 2
                 || !GameState.IsInGameSession || GameState.IsLoading) return;
             if (now < _nextSend) return;
             _nextSend = now + SendInterval;
-            bool full = now >= _nextFullRefresh;
-            if (full) _nextFullRefresh = now + FullRefreshInterval;
-            SendChanged(full);
+            bool forced = _forceFull;
+            _forceFull = false;
+            SendChanged(forced, now, -1, true);
         }
 
         internal static IDisposable ApplyScope()
@@ -290,7 +337,8 @@ namespace PoECoop.Sync
         {
             InventorySync self = s_instance;
             if (self == null || id == Guid.Empty) return null;
-            self.DiscoverModel();
+            // Several lookups in one frame (a paged join, a command's source and target) share one pass.
+            if (self._discoverFrame != Time.frameCount) self.DiscoverModel();
             if (self._inventories.TryGetValue(id, out TrackedInventory tracked) && tracked.Inventory != null)
                 return tracked.Inventory;
             GameObject obj = EntityRegistry.ResolveObject(id);
@@ -385,7 +433,9 @@ namespace PoECoop.Sync
             foreach (TrackedInventory tracked in self._inventories.Values) self.Touch(tracked);
             foreach (TrackedEquipment tracked in self._equipment.Values) self.Touch(tracked);
             self._nextSend = 0f;
-            self.SendChanged(false, playerId);
+            // With a single guest this is the whole audience, so it restarts the integrity schedule like any
+            // other forced refresh. With more guests the others keep their schedule: they did not get this one.
+            self.SendChanged(true, Time.unscaledTime, playerId, playerId < 0 || self._session.Players.Count <= 2);
         }
 
         private void OnFullStateRequested(int playerId, long worldEpoch)
@@ -395,6 +445,8 @@ namespace PoECoop.Sync
 
         private void DiscoverModel()
         {
+            long started = PerfStats.Begin();
+            _discoverFrame = Time.frameCount;
             foreach (PartyMemberAI member in PartyMemberAI.OnlyPrimaryPartyMembers)
             {
                 if (member == null) continue;
@@ -413,12 +465,27 @@ namespace PoECoop.Sync
                 TrackInventory(player.QuestInventory, InventoryKind.Quest, actor);
                 TrackInventory(player.CraftingInventory, InventoryKind.Crafting, actor);
             }
-            foreach (Container container in UnityEngine.Object.FindObjectsOfType<Container>())
+            var containers = AllContainers != null ? AllContainers.GetValue(null) as HashSet<Container> : null;
+            if (containers != null)
             {
-                if (container == null) continue;
-                Guid id = EntityRegistry.NetworkId(container.gameObject);
-                if (id != Guid.Empty) TrackInventory(container.GetComponent<Inventory>(), InventoryKind.Container, id);
+                // Same population a scene scan returns (active objects), minus containers created this frame
+                // that have not started yet; those appear on the next pass.
+                foreach (Container container in containers)
+                    if (container != null && container.gameObject.activeInHierarchy) TrackContainer(container);
             }
+            else if (Time.unscaledTime >= _nextFallbackScan)
+            {
+                _nextFallbackScan = Time.unscaledTime + FallbackScanInterval;
+                foreach (Container container in UnityEngine.Object.FindObjectsOfType<Container>())
+                    if (container != null) TrackContainer(container);
+            }
+            PerfStats.End("inventory.scan", started);
+        }
+
+        private void TrackContainer(Container container)
+        {
+            Guid id = EntityRegistry.NetworkId(container.gameObject);
+            if (id != Guid.Empty) TrackInventory(container.GetComponent<Inventory>(), InventoryKind.Container, id);
         }
 
         private void TrackInventory(BaseInventory inventory, InventoryKind kind, Guid actor)
@@ -477,37 +544,75 @@ namespace PoECoop.Sync
             }
         }
 
-        private void SendChanged(bool full, int targetPlayerId = -1)
+        /// <summary>
+        /// Sends every changed inventory and equipment set, plus the ones whose integrity refresh is due.
+        /// A forced pass refreshes everything now; afterwards each one keeps its own slot in the refresh
+        /// interval, so the periodic refreshes no longer leave as one burst.
+        /// </summary>
+        private void SendChanged(bool forced, float now, int targetPlayerId, bool reschedule)
         {
+            long started = PerfStats.Begin();
+            int total = _inventories.Count + _equipment.Count;
+            int index = 0;
+            int skipped = 0;
             foreach (TrackedInventory tracked in _inventories.Values)
             {
+                index++;
                 if (tracked.Inventory == null) continue;
-                string fingerprint = InventoryFingerprint(tracked.Inventory);
-                if (fingerprint != tracked.Fingerprint)
+                ulong hash = InventoryHash(tracked.Inventory);
+                if (!tracked.HasHash || hash != tracked.Hash)
                 {
-                    tracked.Fingerprint = fingerprint;
+                    tracked.HasHash = true;
+                    tracked.Hash = hash;
                     MarkDirty(tracked);
                 }
-                if (full && !tracked.Dirty) Touch(tracked);
-                if (tracked.Dirty) SendInventory(tracked, targetPlayerId);
+                bool refresh = !tracked.Dirty && (forced || now >= tracked.RefreshAt);
+                if (refresh) Touch(tracked);
+                if (!tracked.Dirty)
+                {
+                    skipped++;
+                    continue;
+                }
+                SendInventory(tracked, targetPlayerId);
+                PerfStats.Count(refresh ? "inventory.full" : "inventory.delta");
+                if (reschedule) tracked.RefreshAt = NextRefresh(forced, now, index, total);
             }
             foreach (TrackedEquipment tracked in _equipment.Values)
             {
+                index++;
                 if (tracked.Equipment == null || CurrentSet(tracked.Equipment) == null) continue;
-                string fingerprint = EquipmentFingerprint(tracked.Equipment);
-                if (fingerprint != tracked.Fingerprint)
+                ulong hash = EquipmentHash(tracked.Equipment);
+                if (!tracked.HasHash || hash != tracked.Hash)
                 {
-                    tracked.Fingerprint = fingerprint;
+                    tracked.HasHash = true;
+                    tracked.Hash = hash;
                     MarkDirty(tracked);
                 }
-                if (full && !tracked.Dirty) Touch(tracked);
-                if (tracked.Dirty) SendEquipment(tracked, targetPlayerId);
+                bool refresh = !tracked.Dirty && (forced || now >= tracked.RefreshAt);
+                if (refresh) Touch(tracked);
+                if (!tracked.Dirty)
+                {
+                    skipped++;
+                    continue;
+                }
+                SendEquipment(tracked, targetPlayerId);
+                PerfStats.Count(refresh ? "inventory.full" : "inventory.delta");
+                if (reschedule) tracked.RefreshAt = NextRefresh(forced, now, index, total);
             }
+            if (skipped > 0) PerfStats.Count("inventory.skipped", skipped);
+            PerfStats.End("inventory.capture", started);
+        }
+
+        private static float NextRefresh(bool forced, float now, int index, int total)
+        {
+            if (!forced) return now + FullRefreshInterval;
+            return now + FullRefreshInterval + ForcedRefreshPhase + FullRefreshInterval * (index - 1) / Math.Max(1, total);
         }
 
         private void SendInventory(TrackedInventory tracked, int targetPlayerId)
         {
-            List<ItemRecord> records = CaptureItems(tracked.Inventory);
+            List<ItemRecord> records = _scratchRecords;
+            CaptureItems(tracked.Inventory, records);
             int pages = Math.Max(1, (records.Count + ItemsPerPage - 1) / ItemsPerPage);
             PlayerInventory player = tracked.Inventory as PlayerInventory;
             int flags = tracked.Inventory is QuestInventory quest && quest.HasNew ? 1 : 0;
@@ -530,17 +635,25 @@ namespace PoECoop.Sync
                 if (targetPlayerId < 0) _session.SendToGuests(data);
                 else _session.SendToPlayer(targetPlayerId, data);
             }
+            PerfStats.Count("inventory.records", records.Count);
+            records.Clear();
             tracked.Dirty = false;
         }
 
         private void SendEquipment(TrackedEquipment tracked, int targetPlayerId)
         {
             EquipmentSet set = CurrentSet(tracked.Equipment);
-            var ids = new List<Guid>();
+            List<Guid> ids = _scratchSlots;
+            List<Guid> weapons = _scratchWeapons;
+            List<ItemRegistry.Recipe> recipes = _scratchRecipes;
+            HashSet<Guid> seen = _scratchIds;
+            ids.Clear();
+            weapons.Clear();
+            recipes.Clear();
+            seen.Clear();
             for (int slot = 0; slot < MaxEquipmentSlots; slot++)
                 ids.Add(ItemId(slot == (int)Equippable.EquipmentSlot.Cape_DEPRECATED
                     ? set.Cape : set.GetItemInSlot((Equippable.EquipmentSlot)slot)));
-            var weapons = new List<Guid>();
             int setCount = Math.Min(MaxWeaponSets, set.AlternateWeaponSets != null ? set.AlternateWeaponSets.Length : 0);
             for (int i = 0; i < setCount; i++)
             {
@@ -548,10 +661,8 @@ namespace PoECoop.Sync
                 weapons.Add(ItemId(weaponSet != null ? weaponSet.PrimaryWeapon : null));
                 weapons.Add(ItemId(weaponSet != null ? weaponSet.SecondaryWeapon : null));
             }
-            var recipes = new List<ItemRegistry.Recipe>();
-            var seen = new HashSet<Guid>();
-            foreach (Guid id in ids) AddRecipe(id, seen, recipes);
-            foreach (Guid id in weapons) AddRecipe(id, seen, recipes);
+            for (int i = 0; i < ids.Count; i++) AddRecipe(ids[i], seen, recipes);
+            for (int i = 0; i < weapons.Count; i++) AddRecipe(weapons[i], seen, recipes);
             bool[] locks = SlotLocks(tracked.Equipment);
             int lockBits = 0;
             for (int i = 0; i < MaxEquipmentSlots && locks != null && i < locks.Length; i++) if (locks[i]) lockBits |= 1 << i;
@@ -559,14 +670,16 @@ namespace PoECoop.Sync
             var writer = new MessageWriter(EquipmentStateMessage)
                 .Long(_worldEpoch).Guid(tracked.Actor).Int(tracked.Revision).Guid(tracked.MutationGroup)
                 .Int(set.SelectedWeaponSet).Int(lockBits).Int(setCount).Int(ids.Count);
-            foreach (Guid id in ids) writer.Guid(id);
+            for (int i = 0; i < ids.Count; i++) writer.Guid(ids[i]);
             writer.Int(weapons.Count);
-            foreach (Guid id in weapons) writer.Guid(id);
+            for (int i = 0; i < weapons.Count; i++) writer.Guid(weapons[i]);
             writer.Int(recipes.Count);
-            foreach (ItemRegistry.Recipe recipe in recipes) ItemRegistry.WriteRecipe(writer, recipe);
+            for (int i = 0; i < recipes.Count; i++) ItemRegistry.WriteRecipe(writer, recipes[i]);
             byte[] data = writer.ToArray();
             if (targetPlayerId < 0) _session.SendToGuests(data);
             else _session.SendToPlayer(targetPlayerId, data);
+            PerfStats.Count("inventory.records", recipes.Count);
+            recipes.Clear();
             tracked.Dirty = false;
         }
 
@@ -611,8 +724,17 @@ namespace PoECoop.Sync
         private void OnGameMessage(PlayerInfo sender, MessageReader reader)
         {
             if (sender != null || !_session.IsGuest) return;
-            if (reader.Type == InventoryStateMessage) ReadInventoryPage(reader);
-            else if (reader.Type == EquipmentStateMessage) ReadEquipment(reader);
+            if (reader.Type != InventoryStateMessage && reader.Type != EquipmentStateMessage) return;
+            long started = PerfStats.Begin();
+            try
+            {
+                if (reader.Type == InventoryStateMessage) ReadInventoryPage(reader);
+                else ReadEquipment(reader);
+            }
+            finally
+            {
+                PerfStats.End("inventory.apply", started);
+            }
         }
 
         private void ReadInventoryPage(MessageReader reader)
@@ -642,7 +764,8 @@ namespace PoECoop.Sync
                 || page.Supplies < 0 || page.Supplies > 1000000 || (page.Flags & ~1) != 0
                 || count < 0 || count > ItemsPerPage) throw new FormatException("inventory page bounds");
             page.Items = new List<ItemRecord>(count);
-            var ids = new HashSet<Guid>();
+            HashSet<Guid> ids = _scratchIds;
+            ids.Clear();
             for (int i = 0; i < count; i++)
             {
                 ItemRecord record = ReadItemRecord(reader);
@@ -664,11 +787,14 @@ namespace PoECoop.Sync
                 || assembly.Epoch != page.Epoch || assembly.Revision != page.Revision
                 || assembly.MutationGroup != page.MutationGroup)
             {
+                // A snapshot that replaces one still waiting for its items inherits the wait already earned.
+                float delay = assembly != null ? assembly.Delay : 0f;
                 assembly = new InventoryAssembly
                 {
                     Epoch = page.Epoch,
                     Revision = page.Revision,
                     MutationGroup = page.MutationGroup,
+                    Delay = delay,
                 };
                 _assemblies[page.InventoryId] = assembly;
             }
@@ -679,35 +805,75 @@ namespace PoECoop.Sync
                 || page.Supplies != first.Supplies || page.Flags != first.Flags)
                 throw new FormatException("inconsistent inventory mutation group");
             assembly.Pages[page.Page] = page;
-            if (assembly.Pages.Count == page.PageCount) TryApplyInventory(page.InventoryId, assembly);
+            if (assembly.Pages.Count == page.PageCount && !TryApplyInventory(page.InventoryId, assembly))
+                Backoff(ref assembly.Delay, ref assembly.NextAttempt, assembly.Costly, Time.unscaledTime);
         }
 
-        private void TryApplyInventory(Guid id, InventoryAssembly assembly)
+        /// <summary>
+        /// A target that does not exist yet is cheap to look for again, so it keeps the base retry rate.
+        /// Items that cannot be created cost a prefab load and a scan of every loaded item per attempt,
+        /// so those retries slow down, up to MaxRetryInterval.
+        /// </summary>
+        private static void Backoff(ref float delay, ref float nextAttempt, bool costly, float now)
         {
-            var records = new List<ItemRecord>(assembly.Pages[0].TotalItems);
-            InventoryPage first = assembly.Pages[0];
-            for (int page = 0; page < first.PageCount; page++)
+            if (!costly)
             {
-                if (!assembly.Pages.TryGetValue(page, out InventoryPage part)) return;
-                records.AddRange(part.Items);
+                nextAttempt = 0f;
+                return;
             }
-            if (records.Count != first.TotalItems) throw new FormatException("inventory page item total");
-            var seen = new HashSet<Guid>();
-            foreach (ItemRecord record in records)
-                if (!seen.Add(record.Recipe.Id)) throw new FormatException("duplicate item in full inventory");
+            delay = delay <= 0f ? RetryInterval : Math.Min(delay * 2f, MaxRetryInterval);
+            nextAttempt = now + delay;
+        }
+
+        /// <summary>False when the snapshot could not be applied yet and stays pending.</summary>
+        private bool TryApplyInventory(Guid id, InventoryAssembly assembly)
+        {
+            assembly.Costly = false;
+            InventoryPage first = assembly.Pages[0];
+            List<ItemRecord> records = assembly.Records;
+            HashSet<Guid> seen = _scratchIds;
+            if (records == null)
+            {
+                records = new List<ItemRecord>(first.TotalItems);
+                for (int page = 0; page < first.PageCount; page++)
+                {
+                    if (!assembly.Pages.TryGetValue(page, out InventoryPage part)) return false;
+                    records.AddRange(part.Items);
+                }
+                if (records.Count != first.TotalItems) throw new FormatException("inventory page item total");
+                seen.Clear();
+                foreach (ItemRecord record in records)
+                    if (!seen.Add(record.Recipe.Id)) throw new FormatException("duplicate item in full inventory");
+                assembly.Records = records;
+            }
 
             BaseInventory inventory = ResolveInventory(id);
-            if (inventory == null) return;
+            if (inventory == null) return false;
             DevTools.UpdateTrace("inventory-resolved");
+            // The host re-sends unchanged inventories as an integrity refresh. When the live inventory already
+            // is what the snapshot describes there is nothing to repair, and rebuilding it would re-save every
+            // item and reload the UI for no change.
+            if (_appliedInventories.ContainsKey(id) && InventoryMatches(inventory, first, records))
+            {
+                PerfStats.Count("inventory.skipped");
+                FinishInventory(id, first, false);
+                return true;
+            }
             var items = new List<KeyValuePair<Item, ItemRecord>>(records.Count);
             foreach (ItemRecord record in records)
             {
                 Item item = ItemRegistry.ResolveOrCreate(record.Recipe);
-                if (item == null) return;
+                if (item == null)
+                {
+                    assembly.Costly = true;
+                    return false;
+                }
                 items.Add(new KeyValuePair<Item, ItemRecord>(item, record));
             }
 
             DevTools.UpdateTrace("inventory-items");
+            seen.Clear();
+            foreach (ItemRecord record in records) seen.Add(record.Recipe.Id);
             using (ApplyScope())
             {
                 foreach (InventoryItem old in inventory.ItemList)
@@ -746,6 +912,14 @@ namespace PoECoop.Sync
                 RefreshUi(inventory);
                 DevTools.UpdateTrace("inventory-ui");
             }
+            PerfStats.Count("inventory.records", records.Count);
+            FinishInventory(id, first, true);
+            return true;
+        }
+
+        /// <summary>Records the snapshot as applied. Nothing is announced when it changed nothing.</summary>
+        private void FinishInventory(Guid id, InventoryPage first, bool changed)
+        {
             _appliedInventories[id] = first.Revision;
             if (_inventories.TryGetValue(id, out TrackedInventory appliedInventory))
             {
@@ -753,7 +927,34 @@ namespace PoECoop.Sync
                 appliedInventory.MutationGroup = first.MutationGroup;
             }
             _assemblies.Remove(id);
-            LootSync.NotifyInventorySnapshotsResolved();
+            if (changed) LootSync.NotifyInventorySnapshotsResolved();
+        }
+
+        /// <summary>
+        /// True when the live inventory holds exactly the snapshot's entries, in order, with every field the
+        /// apply path writes already in place. Any doubt answers false and the snapshot is applied in full.
+        /// </summary>
+        private static bool InventoryMatches(BaseInventory inventory, InventoryPage first, List<ItemRecord> records)
+        {
+            List<InventoryItem> live = InventoryItems(inventory);
+            if (live == null || live.Count != records.Count) return false;
+            if (inventory is PlayerInventory player
+                && (player.currencyTotalValue.v != first.Currency || player.CampingSuppliesTotal != first.Supplies)) return false;
+            Transform parent = inventory.transform;
+            for (int i = 0; i < live.Count; i++)
+            {
+                InventoryItem entry = live[i];
+                ItemRecord record = records[i];
+                if (entry == null) return false;
+                Item item = entry.baseItem;
+                if (ReferenceEquals(item, null) || !ReferenceEquals(ItemRegistry.Known(record.Recipe.Id), item)) return false;
+                if (entry.stackSize != record.Stack || entry.uiSlot != record.Slot || entry.Original != record.Original
+                    || entry.AreaLootSource != record.AreaLootSource) return false;
+                if (item.StoredInventory != inventory || item.Location != Item.ItemLocation.Stored
+                    || item.transform.parent != parent) return false;
+                if (!ItemRegistry.Matches(item, record.Recipe)) return false;
+            }
+            return true;
         }
 
         private void ReadEquipment(MessageReader reader)
@@ -804,25 +1005,41 @@ namespace PoECoop.Sync
                 _worldReady = false;
             }
             if (_appliedEquipment.TryGetValue(record.Actor, out int applied) && record.Revision <= applied) return;
+            if (_pendingEquipment.TryGetValue(record.Actor, out EquipmentRecord waiting)) record.Delay = waiting.Delay;
             _pendingEquipment[record.Actor] = record;
-            TryApplyEquipment(record);
+            if (!TryApplyEquipment(record))
+                Backoff(ref record.Delay, ref record.NextAttempt, record.Costly, Time.unscaledTime);
         }
 
-        private void TryApplyEquipment(EquipmentRecord record)
+        /// <summary>False when the snapshot could not be applied yet and stays pending.</summary>
+        private bool TryApplyEquipment(EquipmentRecord record)
         {
+            record.Costly = false;
             Equipment equipment = ResolveEquipment(record.Actor);
-            if (equipment == null || CurrentSet(equipment) == null) return;
+            if (equipment == null || CurrentSet(equipment) == null) return false;
+            EquipmentSet set = CurrentSet(equipment);
+            // Same reasoning as for inventories: an unchanged refresh must not detach and re-attach every
+            // item, reload the UI and regenerate the character's appearance.
+            if (_appliedEquipment.ContainsKey(record.Actor) && EquipmentMatches(equipment, set, record))
+            {
+                PerfStats.Count("inventory.skipped");
+                FinishEquipment(record, false);
+                return true;
+            }
             var resolved = new Dictionary<Guid, Equippable>();
             foreach (ItemRegistry.Recipe recipe in record.Recipes)
             {
                 Item item = ItemRegistry.ResolveOrCreate(recipe);
                 Equippable equippable = item as Equippable;
-                if (equippable == null) return;
+                if (equippable == null)
+                {
+                    record.Costly = true;
+                    return false;
+                }
                 resolved[recipe.Id] = equippable;
             }
 
             DevTools.UpdateTrace("equipment-resolved");
-            EquipmentSet set = CurrentSet(equipment);
             var oldItems = new HashSet<Equippable>();
             foreach (Equippable old in set) if (old != null) oldItems.Add(old);
             if (set.Cape != null) oldItems.Add(set.Cape);
@@ -879,14 +1096,91 @@ namespace PoECoop.Sync
                 RefreshUi(equipment);
                 DevTools.UpdateTrace("equipment-ui");
             }
+            PerfStats.Count("inventory.records", record.Recipes.Count);
+            FinishEquipment(record, true);
+            return true;
+        }
+
+        private void FinishEquipment(EquipmentRecord record, bool changed)
+        {
             _appliedEquipment[record.Actor] = record.Revision;
             if (_equipment.TryGetValue(record.Actor, out TrackedEquipment appliedEquipment))
             {
                 appliedEquipment.Revision = record.Revision;
                 appliedEquipment.MutationGroup = record.MutationGroup;
             }
-            _pendingEquipment.Remove(record.Actor);
-            LootSync.NotifyInventorySnapshotsResolved();
+            // A newer snapshot may already have replaced this one while it waited.
+            if (_pendingEquipment.TryGetValue(record.Actor, out EquipmentRecord pending) && pending == record)
+                _pendingEquipment.Remove(record.Actor);
+            if (changed) LootSync.NotifyInventorySnapshotsResolved();
+        }
+
+        /// <summary>
+        /// True when the live equipment set, its weapon sets, slot locks, item state and the visual
+        /// bookkeeping PlaceVisual writes all equal what applying this snapshot would leave behind.
+        /// </summary>
+        private bool EquipmentMatches(Equipment equipment, EquipmentSet set, EquipmentRecord record)
+        {
+            if (set.SelectedWeaponSet != record.Selected || set.Slots == null) return false;
+            bool[] locks = SlotLocks(equipment);
+            if (locks == null || locks.Length < MaxEquipmentSlots) return false;
+            for (int i = 0; i < MaxEquipmentSlots; i++)
+                if (locks[i] != ((record.Locks & (1 << i)) != 0)) return false;
+            WeaponSet[] weapons = set.AlternateWeaponSets;
+            if (weapons == null || weapons.Length != record.Weapons.Length / 2) return false;
+            foreach (ItemRegistry.Recipe recipe in record.Recipes)
+            {
+                Item item = ItemRegistry.Known(recipe.Id);
+                if (!(item is Equippable) || !ItemRegistry.Matches(item, recipe)) return false;
+            }
+
+            // Expected slots are collected in the order the apply path places visuals, so the last one wins.
+            Dictionary<Equippable, Equippable.EquipmentSlot> expected = _expectedSlots;
+            expected.Clear();
+            for (int i = 0; i < 11 && i < set.Slots.Length; i++)
+            {
+                Equippable item = KnownEquippable(record.Slots[i]);
+                if (!ReferenceEquals(set.Slots[i].Val, item)) return false;
+                if (item != null) expected[item] = (Equippable.EquipmentSlot)i;
+            }
+            Equippable cape = KnownEquippable(record.Slots[(int)Equippable.EquipmentSlot.Cape_DEPRECATED]);
+            if (!ReferenceEquals(set.Cape, cape)) return false;
+            if (cape != null) expected[cape] = Equippable.EquipmentSlot.Cape_DEPRECATED;
+            for (int i = 0; i < weapons.Length; i++)
+            {
+                if (weapons[i] == null) return false;
+                Equippable primary = KnownEquippable(record.Weapons[i * 2]);
+                Equippable secondary = KnownEquippable(record.Weapons[i * 2 + 1]);
+                if (!ReferenceEquals(weapons[i].PrimaryWeapon, primary)
+                    || !ReferenceEquals(weapons[i].SecondaryWeapon, secondary)) return false;
+                if (primary != null)
+                    expected[primary] = i == record.Selected
+                        ? Equippable.EquipmentSlot.PrimaryWeapon : Equippable.EquipmentSlot.PrimaryWeapon2;
+                if (secondary != null)
+                    expected[secondary] = i == record.Selected
+                        ? Equippable.EquipmentSlot.SecondaryWeapon : Equippable.EquipmentSlot.SecondaryWeapon2;
+            }
+            WeaponSet selected = set.GetSelectedWeaponSet();
+            if (!ReferenceEquals(set.PrimaryWeapon, selected != null ? selected.PrimaryWeapon : null)
+                || !ReferenceEquals(set.SecondaryWeapon, selected != null ? selected.SecondaryWeapon : null)) return false;
+
+            GameObject owner = equipment.gameObject;
+            bool placed = true;
+            foreach (KeyValuePair<Equippable, Equippable.EquipmentSlot> pair in expected)
+            {
+                Equippable item = pair.Key;
+                if (ItemOwner(item) == owner && ItemEquipment(item) == equipment && ItemSlot(item) == pair.Value
+                    && item.Location == Item.ItemLocation.Equipped && item.gameObject.activeSelf) continue;
+                placed = false;
+                break;
+            }
+            expected.Clear();
+            return placed;
+        }
+
+        private static Equippable KnownEquippable(Guid id)
+        {
+            return ItemRegistry.Known(id) as Equippable;
         }
 
         private static Equippable ResolveEquipmentItem(Dictionary<Guid, Equippable> items, Guid id)
@@ -926,18 +1220,35 @@ namespace PoECoop.Sync
             if (inventory != null) item.Location = Item.ItemLocation.Stored;
         }
 
-        private void RetryPending()
+        private void RetryPending(float now)
         {
             if (_assemblies.Count > 0)
             {
-                var assemblies = new List<KeyValuePair<Guid, InventoryAssembly>>(_assemblies);
+                List<KeyValuePair<Guid, InventoryAssembly>> assemblies = _scratchAssemblies;
+                assemblies.Clear();
+                foreach (KeyValuePair<Guid, InventoryAssembly> pair in _assemblies) assemblies.Add(pair);
                 foreach (KeyValuePair<Guid, InventoryAssembly> pair in assemblies)
-                    if (pair.Value.Pages.Count == pair.Value.Pages[0].PageCount) TryApplyInventory(pair.Key, pair.Value);
+                {
+                    InventoryAssembly assembly = pair.Value;
+                    if (now < assembly.NextAttempt || !assembly.Pages.TryGetValue(0, out InventoryPage first)
+                        || assembly.Pages.Count != first.PageCount) continue;
+                    if (!TryApplyInventory(pair.Key, assembly))
+                        Backoff(ref assembly.Delay, ref assembly.NextAttempt, assembly.Costly, now);
+                }
+                assemblies.Clear();
             }
             if (_pendingEquipment.Count > 0)
             {
-                var pending = new List<EquipmentRecord>(_pendingEquipment.Values);
-                foreach (EquipmentRecord record in pending) TryApplyEquipment(record);
+                List<EquipmentRecord> pending = _scratchEquipment;
+                pending.Clear();
+                foreach (EquipmentRecord record in _pendingEquipment.Values) pending.Add(record);
+                foreach (EquipmentRecord record in pending)
+                {
+                    if (now < record.NextAttempt) continue;
+                    if (!TryApplyEquipment(record))
+                        Backoff(ref record.Delay, ref record.NextAttempt, record.Costly, now);
+                }
+                pending.Clear();
             }
         }
 
@@ -1004,7 +1315,7 @@ namespace PoECoop.Sync
         {
             if (!_session.IsHost) return;
             _nextSend = 0f;
-            _nextFullRefresh = 0f;
+            _forceFull = true;
             foreach (TrackedInventory tracked in _inventories.Values) tracked.Dirty = true;
             foreach (TrackedEquipment tracked in _equipment.Values) tracked.Dirty = true;
         }
@@ -1017,10 +1328,23 @@ namespace PoECoop.Sync
             _appliedEquipment.Clear();
             _appearanceAt.Clear();
             _possiblyRemoved.Clear();
+            _uiInventories.Clear();
             _nextSend = 0f;
-            _nextFullRefresh = 0f;
+            _forceFull = true;
             _nextRetry = 0f;
+            _nextDiscover = 0f;
             if (_session.IsGuest) _worldReady = false;
+            // Inventories destroyed with the previous level would otherwise be walked on every send forever.
+            List<Guid> dead = _scratchDead;
+            dead.Clear();
+            foreach (KeyValuePair<Guid, TrackedInventory> pair in _inventories)
+                if (pair.Value.Inventory == null) dead.Add(pair.Key);
+            foreach (Guid id in dead) _inventories.Remove(id);
+            dead.Clear();
+            foreach (KeyValuePair<Guid, TrackedEquipment> pair in _equipment)
+                if (pair.Value.Equipment == null) dead.Add(pair.Key);
+            foreach (Guid id in dead) _equipment.Remove(id);
+            dead.Clear();
         }
 
         private void MarkDirty(TrackedInventory tracked)
@@ -1081,9 +1405,9 @@ namespace PoECoop.Sync
 
         private static int BoundedMaxItems(int maxItems) => maxItems < 0 || maxItems == int.MaxValue ? -1 : Math.Min(maxItems, 1000000);
 
-        private static List<ItemRecord> CaptureItems(BaseInventory inventory)
+        private static void CaptureItems(BaseInventory inventory, List<ItemRecord> records)
         {
-            var records = new List<ItemRecord>();
+            records.Clear();
             foreach (InventoryItem item in inventory.ItemList)
             {
                 if (item == null || item.baseItem == null || item.stackSize <= 0 || records.Count >= MaxItemsPerInventory) continue;
@@ -1098,7 +1422,6 @@ namespace PoECoop.Sync
                     AreaLootSource = item.AreaLootSource,
                 });
             }
-            return records;
         }
 
         private static Guid ItemId(Item item) => item != null ? ItemRegistry.NetworkId(item) : Guid.Empty;
@@ -1111,67 +1434,81 @@ namespace PoECoop.Sync
             if (recipe != null) recipes.Add(recipe);
         }
 
-        private static string InventoryFingerprint(BaseInventory inventory)
+        /// <summary>
+        /// Change detector for state that raises no inventory event (charges, slots, stacks, soulbind
+        /// progress). Covers what a snapshot carries, in order, without building one.
+        /// </summary>
+        private static ulong InventoryHash(BaseInventory inventory)
         {
-            var text = new System.Text.StringBuilder();
+            ulong hash = HashSeed;
             PlayerInventory player = inventory as PlayerInventory;
-            if (player != null) text.Append(player.currencyTotalValue.v).Append('|').Append(player.CampingSuppliesTotal).Append('|');
-            if (inventory is QuestInventory quest) text.Append(quest.HasNew).Append('|');
-            foreach (ItemRecord record in CaptureItems(inventory))
+            if (player != null)
+                hash = ItemRegistry.Mix(ItemRegistry.Mix(hash, player.currencyTotalValue.v), (ulong)player.CampingSuppliesTotal);
+            if (inventory is QuestInventory quest) hash = ItemRegistry.Mix(hash, quest.HasNew ? 1UL : 2UL);
+            List<InventoryItem> items = inventory.ItemList;
+            int count = 0;
+            for (int i = 0; i < items.Count; i++)
             {
-                AppendRecipeFingerprint(text, record.Recipe);
-                text.Append(record.Stack).Append(',').Append(record.Slot).Append(',')
-                    .Append(record.Original).Append(',').Append(record.AreaLootSource).Append(';');
+                InventoryItem item = items[i];
+                if (item == null || item.baseItem == null || item.stackSize <= 0 || count >= MaxItemsPerInventory) continue;
+                if (!ItemRegistry.MixState(item.baseItem, ref hash)) continue;
+                count++;
+                hash = ItemRegistry.Mix(ItemRegistry.Mix(hash, (ulong)item.stackSize), (ulong)item.uiSlot);
+                hash = ItemRegistry.Mix(hash, (item.Original ? 1UL : 0UL) | (item.AreaLootSource ? 2UL : 0UL));
             }
-            return text.ToString();
+            return ItemRegistry.Mix(hash, (ulong)count);
         }
 
-        private static string EquipmentFingerprint(Equipment equipment)
+        private static ulong EquipmentHash(Equipment equipment)
         {
-            var text = new System.Text.StringBuilder();
             EquipmentSet set = CurrentSet(equipment);
-            if (set == null) return "";
-            text.Append(set.SelectedWeaponSet).Append('|');
+            if (set == null) return 0UL;
+            ulong hash = ItemRegistry.Mix(HashSeed, (ulong)set.SelectedWeaponSet);
             bool[] locks = SlotLocks(equipment);
-            if (locks != null) foreach (bool value in locks) text.Append(value ? '1' : '0');
-            text.Append('|');
+            if (locks != null)
+                for (int i = 0; i < locks.Length; i++) hash = ItemRegistry.Mix(hash, locks[i] ? 1UL : 0UL);
             for (int i = 0; i < MaxEquipmentSlots; i++)
-                text.Append(ItemId(i == (int)Equippable.EquipmentSlot.Cape_DEPRECATED
-                    ? set.Cape : set.GetItemInSlot((Equippable.EquipmentSlot)i))).Append(',');
-            if (set.AlternateWeaponSets != null)
-                foreach (WeaponSet weapons in set.AlternateWeaponSets)
+                hash = MixEquipped(hash, i == (int)Equippable.EquipmentSlot.Cape_DEPRECATED
+                    ? set.Cape : set.GetItemInSlot((Equippable.EquipmentSlot)i));
+            WeaponSet[] weapons = set.AlternateWeaponSets;
+            if (weapons != null)
+                for (int i = 0; i < weapons.Length; i++)
                 {
-                    text.Append(ItemId(weapons != null ? weapons.PrimaryWeapon : null)).Append(',')
-                        .Append(ItemId(weapons != null ? weapons.SecondaryWeapon : null)).Append(';');
+                    hash = MixEquipped(hash, weapons[i] != null ? weapons[i].PrimaryWeapon : null);
+                    hash = MixEquipped(hash, weapons[i] != null ? weapons[i].SecondaryWeapon : null);
                 }
-            foreach (Equippable item in set)
-                if (item != null) AppendRecipeFingerprint(text, ItemRegistry.Capture(item));
-            if (set.Cape != null) AppendRecipeFingerprint(text, ItemRegistry.Capture(set.Cape));
-            return text.ToString();
+            return hash;
         }
 
-        private static void AppendRecipeFingerprint(System.Text.StringBuilder text, ItemRegistry.Recipe recipe)
+        private static ulong MixEquipped(ulong hash, Equippable item)
         {
-            if (recipe == null) { text.Append("null;"); return; }
-            text.Append(recipe.Id).Append(recipe.PrefabKey).Append(recipe.ConsumableUsage).Append(recipe.ConsumableLevel)
-                .Append(recipe.GrimoireOwner).Append(recipe.BoundActor).Append(recipe.UnlockLevel)
-                .Append(recipe.UnlockProgress).Append(recipe.DegenerateProgress).Append(recipe.LastUnlockDegenerate)
-                .Append(recipe.BoundClass).Append(recipe.CachedNameTable).Append(recipe.CachedNameId)
-                .Append(recipe.CachedOwnerOverride);
-            foreach (string mod in recipe.Mods) text.Append(mod).Append(',');
-            foreach (int counter in recipe.ModCounters) text.Append(counter).Append(',');
-            foreach (string spell in recipe.Spells) text.Append(spell).Append(',');
-            text.Append(';');
+            if (item == null) return ItemRegistry.Mix(hash, 0UL);
+            return ItemRegistry.MixState(item, ref hash) ? ItemRegistry.Mix(hash, 1UL) : ItemRegistry.Mix(hash, 2UL);
         }
 
-        private static void RefreshUi(BaseInventory inventory)
+        private void RefreshUi(BaseInventory inventory)
         {
-            foreach (UIInventoryItemGrid grid in UnityEngine.Object.FindObjectsOfType<UIInventoryItemGrid>())
-                if (grid != null && grid.Inventory == inventory) grid.Reload();
-            if (UIAbilityBar.Instance != null)
+            // Reloaded once per frame by FlushUi, however many inventories that frame applied.
+            _uiInventories.Add(inventory);
+        }
+
+        private void FlushUi()
+        {
+            if (_uiInventories.Count == 0) return;
+            using (ApplyScope())
             {
-                UIAbilityBar.Instance.RefreshQuickItems();
-                UIAbilityBar.Instance.RefreshAbilities();
+                foreach (UIInventoryItemGrid grid in UnityEngine.Object.FindObjectsOfType<UIInventoryItemGrid>())
+                {
+                    if (grid == null) continue;
+                    BaseInventory inventory = grid.Inventory;
+                    if (inventory != null && _uiInventories.Contains(inventory)) grid.Reload();
+                }
+                _uiInventories.Clear();
+                if (UIAbilityBar.Instance != null)
+                {
+                    UIAbilityBar.Instance.RefreshQuickItems();
+                    UIAbilityBar.Instance.RefreshAbilities();
+                }
             }
         }
 

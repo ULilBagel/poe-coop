@@ -142,6 +142,13 @@ namespace PoECoop.Sync
 
         public void Update(float now)
         {
+            long perf = PerfStats.Begin();
+            UpdateCore(now);
+            PerfStats.End("areatransition.update", perf);
+        }
+
+        private void UpdateCore(float now)
+        {
             SyncSession();
             if (!_session.IsHost && !_session.IsGuest) return;
 
@@ -231,7 +238,9 @@ namespace PoECoop.Sync
             {
                 if (requestId != SameMapNotificationId || result != FlowResultCode.Ok
                     || worldEpoch != FlowCoordinator.WorldEpoch || !CanApplyHostNotification()) return;
+                long perf = PerfStats.Begin();
                 ApplySameMapTeleport();
+                PerfStats.End("areatransition.apply", perf);
                 return;
             }
 

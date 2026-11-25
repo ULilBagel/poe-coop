@@ -15,6 +15,9 @@ namespace PoECoop.Sync
     {
         private const float SendInterval = 0.1f;
         private const float FullRefreshInterval = 3f;
+        // Keeps the periodic refresh out of the frame the other streams use after a forced one.
+        private const float FullRefreshPhase = 0.75f;
+        private const int MaxAnimationOwners = 4096;
         private const int MaxRecords = 16384;
         private const float MaxVitalValue = 1000000f;
         private const float MaxUnconsciousDelay = 3600f;
@@ -41,6 +44,18 @@ namespace PoECoop.Sync
         private readonly Dictionary<Health, Sample> _latest = new Dictionary<Health, Sample>();
         private readonly HashSet<Health> _pendingStandups = new HashSet<Health>();
 
+        // Host: every Health that has started or been found by a scan; destroyed ones are pruned.
+        private readonly List<Health> _tracked = new List<Health>();
+        private readonly HashSet<Health> _trackedSet = new HashSet<Health>(ReferenceComparer.Instance);
+        private readonly HashSet<Guid> _seen = new HashSet<Guid>();
+        private readonly List<Guid> _gone = new List<Guid>();
+
+        // Guest: lookups that would otherwise repeat for every record and every animated actor each frame.
+        private readonly Dictionary<Guid, Resolved> _resolved = new Dictionary<Guid, Resolved>();
+        private readonly Dictionary<AnimationController, Health> _animationOwners =
+            new Dictionary<AnimationController, Health>(AnimationComparer.Instance);
+        private readonly List<KeyValuePair<Guid, Sample>> _records = new List<KeyValuePair<Guid, Sample>>();
+
         private float _nextSend, _nextFullRefresh;
         private int _epoch, _revision;
         private bool _active;
@@ -55,6 +70,27 @@ namespace PoECoop.Sync
         {
             public int State = -1; // -1 unknown, 0 alive, 1 unconscious, 2 dead
             public bool MoverCollision;
+        }
+
+        private struct Resolved
+        {
+            public GameObject Object;
+            public Health Health;
+        }
+
+        // Identity only: a destroyed component must still be removable from the tracked set.
+        private sealed class ReferenceComparer : IEqualityComparer<Health>
+        {
+            public static readonly ReferenceComparer Instance = new ReferenceComparer();
+            public bool Equals(Health a, Health b) => ReferenceEquals(a, b);
+            public int GetHashCode(Health health) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(health);
+        }
+
+        private sealed class AnimationComparer : IEqualityComparer<AnimationController>
+        {
+            public static readonly AnimationComparer Instance = new AnimationComparer();
+            public bool Equals(AnimationController a, AnimationController b) => ReferenceEquals(a, b);
+            public int GetHashCode(AnimationController controller) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(controller);
         }
 
         public VitalsSync(Session session)
@@ -89,11 +125,42 @@ namespace PoECoop.Sync
             _presentations.Clear();
             _latest.Clear();
             _pendingStandups.Clear();
+            _resolved.Clear();
+            _animationOwners.Clear();
+            PruneTracked();
             _revision = 0;
             _nextSend = 0f;
             _nextFullRefresh = 0f;
             if (_session.IsHost) _epoch++;
             else _epoch = -1;
+        }
+
+        /// <summary>Called as a Health starts, so new actors are sampled without a scene scan every tick.</summary>
+        internal static void Track(Health health)
+        {
+            VitalsSync self = s_instance;
+            if (self != null && self._trackedSet.Add(health)) self._tracked.Add(health);
+        }
+
+        private void PruneTracked()
+        {
+            for (int i = _tracked.Count - 1; i >= 0; i--)
+            {
+                Health health = _tracked[i];
+                if (health != null) continue;
+                _trackedSet.Remove(health);
+                _tracked[i] = _tracked[_tracked.Count - 1];
+                _tracked.RemoveAt(_tracked.Count - 1);
+            }
+        }
+
+        /// <summary>Repairs the tracked set: actors that started before this module, or were missed.</summary>
+        private void ScanTracked()
+        {
+            PruneTracked();
+            Health[] healths = UnityEngine.Object.FindObjectsOfType<Health>();
+            for (int i = 0; i < healths.Length; i++)
+                if (healths[i] != null && _trackedSet.Add(healths[i])) _tracked.Add(healths[i]);
         }
 
         public void Update(float now)
@@ -108,21 +175,33 @@ namespace PoECoop.Sync
             _nextSend = now + SendInterval;
             if (_session.Players.Count < 2 || !GameState.IsInGameSession || GameState.IsLoading) return;
 
+            long started = PerfStats.Begin();
             bool full = now >= _nextFullRefresh;
-            if (full) _nextFullRefresh = now + FullRefreshInterval;
+            if (full)
+            {
+                // A forced refresh (join, level load) is immediate; later ones keep their own phase.
+                _nextFullRefresh = now + FullRefreshInterval + (_nextFullRefresh <= 0f ? FullRefreshPhase : 0f);
+                ScanTracked();
+                _seen.Clear();
+            }
 
             MessageWriter message = null;
             if (full) message = NewMessage(full: true);
-            int count = 0;
-            HashSet<Guid> seen = full ? new HashSet<Guid>() : null;
-            Health[] healths = UnityEngine.Object.FindObjectsOfType<Health>();
-            for (int i = 0; i < healths.Length && count < MaxRecords; i++)
+            int count = 0, skipped = 0;
+            for (int i = 0; i < _tracked.Count && count < MaxRecords; i++)
             {
-                Health health = healths[i];
-                if (health == null || !TryGetId(health.gameObject, out Guid id)) continue;
-                seen?.Add(id);
+                Health health = _tracked[i];
+                if (health == null) continue;
+                GameObject obj = health.gameObject;
+                // Matches what a scene scan returns: inactive actors are not sampled.
+                if (!obj.activeInHierarchy || !TryGetId(obj, out Guid id)) continue;
+                if (full) _seen.Add(id);
                 var sample = Capture(health);
-                if (!full && _sent.TryGetValue(id, out Sample last) && Same(last, sample)) continue;
+                if (!full && _sent.TryGetValue(id, out Sample last) && Same(last, sample))
+                {
+                    skipped++;
+                    continue;
+                }
                 _sent[id] = sample;
                 if ((sample.Flags & 2) != 0) AttackVisualSync.OnEntityDeath(id);
                 if (message == null) message = NewMessage(full: false);
@@ -130,21 +209,27 @@ namespace PoECoop.Sync
                 count++;
             }
 
-            if (full && _sent.Count > seen.Count)
+            if (full && _sent.Count > _seen.Count)
             {
-                var gone = new List<Guid>();
-                foreach (Guid id in _sent.Keys) if (!seen.Contains(id)) gone.Add(id);
-                foreach (Guid id in gone) _sent.Remove(id);
+                _gone.Clear();
+                foreach (Guid id in _sent.Keys) if (!_seen.Contains(id)) _gone.Add(id);
+                for (int i = 0; i < _gone.Count; i++) _sent.Remove(_gone[i]);
+                _gone.Clear();
             }
-            if (message == null) return;
-
-            byte[] data = message.ToArray();
-            data[CountOffset] = (byte)count;
-            data[CountOffset + 1] = (byte)(count >> 8);
-            data[CountOffset + 2] = (byte)(count >> 16);
-            data[CountOffset + 3] = (byte)(count >> 24);
-            _session.SendToGuests(data);
-            _revision++;
+            if (message != null)
+            {
+                byte[] data = message.ToArray();
+                data[CountOffset] = (byte)count;
+                data[CountOffset + 1] = (byte)(count >> 8);
+                data[CountOffset + 2] = (byte)(count >> 16);
+                data[CountOffset + 3] = (byte)(count >> 24);
+                _session.SendToGuests(data);
+                _revision++;
+                PerfStats.Count(full ? "vitals.full" : "vitals.delta");
+                PerfStats.Count("vitals.records", count);
+            }
+            PerfStats.Count("vitals.skipped", skipped);
+            PerfStats.End("vitals.capture", started);
         }
 
         private MessageWriter NewMessage(bool full)
@@ -200,9 +285,15 @@ namespace PoECoop.Sync
             int count = reader.Int();
             if (full > 1) throw new FormatException("vitals full flag " + full);
             if (count < 0 || count > MaxRecords) throw new FormatException("vitals count " + count);
-            if (epoch == _epoch && revision <= _revision) return;
+            if (epoch == _epoch && revision <= _revision)
+            {
+                PerfStats.Count("vitals.skipped", count);
+                return;
+            }
 
-            var records = new List<KeyValuePair<Guid, Sample>>(count);
+            long started = PerfStats.Begin();
+            List<KeyValuePair<Guid, Sample>> records = _records;
+            records.Clear();
             for (int i = 0; i < count; i++)
             {
                 Guid id = reader.Guid();
@@ -225,18 +316,39 @@ namespace PoECoop.Sync
                 _presentations.Clear();
                 _latest.Clear();
                 _pendingStandups.Clear();
+                _resolved.Clear();
+                _animationOwners.Clear();
             }
             _epoch = epoch;
             _revision = revision;
             for (int i = 0; i < records.Count; i++) Apply(records[i].Key, records[i].Value);
+            PerfStats.Count(full == 1 ? "vitals.full" : "vitals.delta");
+            PerfStats.Count("vitals.records", records.Count);
+            records.Clear();
+            PerfStats.End("vitals.apply", started);
+        }
+
+        /// <summary>The registry is still asked every time, so a rebound id is noticed; only the component lookup is kept.</summary>
+        private Health ResolveHealth(Guid id)
+        {
+            GameObject obj = EntityRegistry.ResolveObject(id);
+            if (obj == null) obj = InstanceID.GetObjectByID(id);
+            if (obj == null) return null;
+            if (_resolved.TryGetValue(id, out Resolved known) && ReferenceEquals(known.Object, obj) && known.Health != null)
+                return known.Health;
+            Health health = obj.GetComponent<Health>();
+            if (health != null) _resolved[id] = new Resolved { Object = obj, Health = health };
+            return health;
         }
 
         private void Apply(Guid id, Sample sample)
         {
-            GameObject obj = EntityRegistry.ResolveObject(id);
-            if (obj == null) obj = InstanceID.GetObjectByID(id);
-            Health health = obj != null ? obj.GetComponent<Health>() : null;
-            if (health == null) return;
+            Health health = ResolveHealth(id);
+            if (health == null)
+            {
+                PerfStats.Count("vitals.skipped");
+                return;
+            }
 
             bool wasDown = health.Dead || health.Unconscious;
             CurrentHealth(health) = sample.CurrentHealth;
@@ -311,8 +423,22 @@ namespace PoECoop.Sync
         internal static void MaintainReaction(AnimationController controller)
         {
             VitalsSync self = s_instance;
-            if (self == null || !Plugin.IsMirroring || controller == null) return;
-            Health health = controller.GetComponent<Health>();
+            if (self == null || self._latest.Count == 0 || !Plugin.IsMirroring || controller == null) return;
+            long started = PerfStats.Begin();
+            self.MaintainReactionFor(controller);
+            PerfStats.End("vitals.update", started);
+        }
+
+        private void MaintainReactionFor(AnimationController controller)
+        {
+            VitalsSync self = this;
+            if (!self._animationOwners.TryGetValue(controller, out Health health))
+            {
+                // Remembered even when there is none, so actors without Health are not searched every frame.
+                if (self._animationOwners.Count >= MaxAnimationOwners) self._animationOwners.Clear();
+                health = controller.GetComponent<Health>();
+                self._animationOwners[controller] = health;
+            }
             if (health == null || !self._latest.TryGetValue(health, out Sample sample)) return;
             if (controller.CurrentAvatar == null) controller.BindComponents();
             if (controller.CurrentAvatar == null) return;
@@ -348,7 +474,7 @@ namespace PoECoop.Sync
         {
             value = 0f;
             VitalsSync self = s_instance;
-            if (self == null || !Plugin.IsMirroring || health == null
+            if (self == null || self._latest.Count == 0 || !Plugin.IsMirroring || health == null
                 || !self._latest.TryGetValue(health, out Sample sample)) return false;
             value = stamina ? sample.MaxStamina : sample.MaxHealth;
             return true;
@@ -361,6 +487,8 @@ namespace PoECoop.Sync
             _presentations.Clear();
             _latest.Clear();
             _pendingStandups.Clear();
+            _resolved.Clear();
+            _animationOwners.Clear();
             _epoch = 0;
             _revision = 0;
             _nextSend = 0f;

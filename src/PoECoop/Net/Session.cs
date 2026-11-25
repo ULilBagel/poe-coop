@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace PoECoop.Net
 {
@@ -21,6 +22,32 @@ namespace PoECoop.Net
         public const int HostId = 0;
 
         private const float HelloTimeoutSeconds = 5f;
+        private const float PerfPingIntervalSeconds = 0.5f;
+        private const float PerfPingTimeoutSeconds = 5f;
+        private const byte PerfPing = 0;
+        private const byte PerfPong = 1;
+
+        // Guest receive budget: once handlers have used this much of a frame, what is still
+        // queued waits for the next frame, in arrival order. See DispatchInbox.
+        private const double ReceiveBudgetMilliseconds = 6.0;
+        // A carried-over backlog beyond any of these is applied completely in one frame, so
+        // deferring can cost at most about this much latency and never accumulates.
+        private const double MaxDeferredAgeMilliseconds = 100.0;
+        private const int MaxDeferredMessages = 200;
+        private const long MaxDeferredBytes = 256 << 10;
+        // After the world becomes ready the first full state is applied without a budget.
+        private const double ReadySettleMilliseconds = 1000.0;
+
+        private static readonly long ReceiveBudgetTicks = MillisecondsToTicks(ReceiveBudgetMilliseconds);
+        private static readonly long MaxDeferredAgeTicks = MillisecondsToTicks(MaxDeferredAgeMilliseconds);
+        private static readonly long ReadySettleTicks = MillisecondsToTicks(ReadySettleMilliseconds);
+
+        private struct Received
+        {
+            public TransportEvent Event;
+            public long Stamp;
+            public bool Urgent;
+        }
 
         private readonly string _modVersion;
         private readonly string _gameVersion;
@@ -36,6 +63,24 @@ namespace PoECoop.Net
         private readonly HashSet<int> _readyPeers = new HashSet<int>();
         private bool _localWorldReady;
         private int _nextPlayerId = 1;
+        // Guest only, and only with --coop-perf: the round trip being measured.
+        private long _perfPingStamp;
+        private float _perfPingSentAt;
+        private float _nextPerfPing;
+        // Everything taken from the transport and not handled yet, oldest first. It belongs to
+        // the current transport: Reset empties it together with the connection it came from.
+        private readonly Queue<Received> _inbox = new Queue<Received>();
+        private long _inboxBytes;
+        private int _inboxUrgent;
+        private int _inboxCountedDeferred;
+        private long _deferAllowedAt;
+
+        /// <summary>
+        /// Game-side veto for the guest receive budget: return false whenever received
+        /// messages must all be applied in the frame they arrive (loading, no level, a
+        /// world barrier). Not set means never defer. Main thread only.
+        /// </summary>
+        internal Func<bool> CanDeferReceive;
 
         public SessionState State { get; private set; }
         /// <summary>Changes whenever the local session is replaced or reset.</summary>
@@ -190,7 +235,7 @@ namespace PoECoop.Net
             if (State == SessionState.Hosting)
                 Broadcast(HostId, text);
             else if (State == SessionState.Joined)
-                _transport.Send(0, new MessageWriter(MessageType.Chat).String(text).ToArray());
+                Transmit(0, new MessageWriter(MessageType.Chat).String(text).ToArray());
         }
 
         /// <summary>Guest only. Gameplay is held until the correlated world state is ready.</summary>
@@ -200,7 +245,7 @@ namespace PoECoop.Net
             MessageType type = SentType(message);
             if (!_localWorldReady && type >= MessageType.FirstGameMessage
                 && type != MessageType.SaveLoaded && type != MessageType.WorldReady) return;
-            _transport.Send(0, message);
+            Transmit(0, message);
         }
 
         /// <summary>Host only. Handoff messages may cross before this peer is ready; gameplay may not.</summary>
@@ -211,7 +256,7 @@ namespace PoECoop.Net
             if (type >= MessageType.FirstGameMessage && !_readyPeers.Contains(playerId)
                 && type != MessageType.SaveBegin && type != MessageType.SaveChunk && type != MessageType.WorldState) return;
             foreach (var pair in _byConnection)
-                if (pair.Value.Id == playerId) { _transport.Send(pair.Key, message); return; }
+                if (pair.Value.Id == playerId) { Transmit(pair.Key, message); return; }
         }
 
         /// <summary>Adds a line to the chat log on this machine only.</summary>
@@ -229,8 +274,88 @@ namespace PoECoop.Net
             if (_transport == null) return;
             // The transport can be replaced or dropped while handling an event.
             var transport = _transport;
+            long perfStart = PerfStats.Begin();
+            long started = Stopwatch.GetTimestamp();
+            if (perfStart != 0L) SampleIncomingQueue(transport);
+
+            // What earlier frames left behind decides, before anything new is added, whether
+            // this frame has to catch up completely.
+            bool drainAll = State != SessionState.Joined || DeferredBacklogTooLarge(started);
+
+            // The transport is always emptied, so its sending, flushing, keep-alives and
+            // timeouts run every frame no matter how much of this is handled now.
             while (transport == _transport && transport.Poll(out var e))
             {
+                bool urgent = IsUrgent(e);
+                _inbox.Enqueue(new Received { Event = e, Stamp = started, Urgent = urgent });
+                if (urgent) _inboxUrgent++;
+                if (e.Type == TransportEventType.Data && e.Data != null && e.Data.Length > 0)
+                {
+                    _inboxBytes += e.Data.Length;
+                    if (perfStart != 0L) PerfStats.NetReceived(e.Data[0], e.Data.Length);
+                }
+            }
+
+            // A transport callback inside Poll may have ended or replaced the session.
+            if (transport != _transport) ClearInbox();
+
+            int perfMessages = 0;
+            long perfBytes = 0;
+            if (transport == _transport) DispatchInbox(transport, now, started, drainAll, ref perfMessages, ref perfBytes);
+
+            if (State == SessionState.Hosting && _awaitingHello.Count > 0) DropSilentConnections(now);
+            if (perfStart != 0L)
+            {
+                PerfStats.Gauge("net.frame_messages", perfMessages);
+                PerfStats.Gauge("net.frame_bytes", perfBytes);
+                PerfStats.Gauge("net.backlog_messages", _inbox.Count);
+                PerfStats.Gauge("net.backlog_age_ms", _inbox.Count > 0
+                    ? (Stopwatch.GetTimestamp() - _inbox.Peek().Stamp) * 1000.0 / Stopwatch.Frequency : 0.0);
+                if (transport == _transport)
+                {
+                    SampleOutgoingQueue(transport);
+                    SendPerfPing(now);
+                }
+                PerfStats.End("session.update", perfStart);
+            }
+        }
+
+        /// <summary>
+        /// Handles queued events strictly in arrival order. On a guest inside a ready world
+        /// it stops once the frame's budget is used and leaves the rest for the next frame;
+        /// nothing is dropped, merged or reordered. It never stops in front of an urgent
+        /// event (see IsUrgent), so those and everything that arrived before them are
+        /// handled in the frame they arrive, and it always handles at least one event.
+        /// </summary>
+        private void DispatchInbox(ITransport transport, float now, long started, bool drainAll,
+            ref int perfMessages, ref long perfBytes)
+        {
+            long deadline = started + ReceiveBudgetTicks;
+            bool handledAny = false;
+            while (transport == _transport && _inbox.Count > 0)
+            {
+                if (!drainAll && handledAny && _inboxUrgent == 0
+                    && Stopwatch.GetTimestamp() >= deadline && MayDeferReceive())
+                {
+                    if (_inbox.Count > _inboxCountedDeferred)
+                    {
+                        PerfStats.Count("net.deferred", _inbox.Count - _inboxCountedDeferred);
+                        _inboxCountedDeferred = _inbox.Count;
+                    }
+                    return;
+                }
+
+                Received item = _inbox.Dequeue();
+                TransportEvent e = item.Event;
+                if (item.Urgent) _inboxUrgent--;
+                if (_inboxCountedDeferred > 0) _inboxCountedDeferred--;
+                if (e.Type == TransportEventType.Data && e.Data != null && e.Data.Length > 0)
+                {
+                    _inboxBytes -= e.Data.Length;
+                    perfMessages++;
+                    perfBytes += e.Data.Length;
+                }
+                handledAny = true;
                 try
                 {
                     if (State == SessionState.Hosting) HostHandle(e, now);
@@ -246,8 +371,60 @@ namespace PoECoop.Net
                     else { Reset(); Status("Disconnected: bad data from host"); }
                 }
             }
-            if (State == SessionState.Hosting && _awaitingHello.Count > 0) DropSilentConnections(now);
         }
+
+        /// <summary>
+        /// Events that are never held back: connection events, session control, the save
+        /// transfer, world handoff/readiness markers and shared-flow commands and results.
+        /// Because order is kept, one of these in the queue also forces everything that
+        /// arrived before it to be handled in the same frame.
+        /// </summary>
+        private static bool IsUrgent(TransportEvent e)
+        {
+            if (e.Type != TransportEventType.Data || e.Data == null || e.Data.Length == 0) return true;
+            MessageType type = (MessageType)e.Data[0];
+            if (type < MessageType.FirstGameMessage) return true;
+            switch (type)
+            {
+                case MessageType.SaveBegin:
+                case MessageType.SaveChunk:
+                case MessageType.SaveLoaded:
+                case MessageType.WorldState:
+                case MessageType.WorldReady:
+                case MessageType.FlowCommand:
+                case MessageType.FlowResult:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Asked only at the moment a frame would stop early, so it sees the state the handlers just left.</summary>
+        private bool MayDeferReceive()
+        {
+            if (State != SessionState.Joined || !_localWorldReady) return false;
+            if (Stopwatch.GetTimestamp() < _deferAllowedAt) return false;
+            var allowed = CanDeferReceive;
+            return allowed != null && allowed();
+        }
+
+        private bool DeferredBacklogTooLarge(long nowTicks)
+        {
+            if (_inbox.Count == 0) return false;
+            return _inbox.Count > MaxDeferredMessages || _inboxBytes > MaxDeferredBytes
+                || nowTicks - _inbox.Peek().Stamp >= MaxDeferredAgeTicks;
+        }
+
+        private void ClearInbox()
+        {
+            _inbox.Clear();
+            _inboxBytes = 0;
+            _inboxUrgent = 0;
+            _inboxCountedDeferred = 0;
+        }
+
+        private static long MillisecondsToTicks(double milliseconds)
+            => (long)(milliseconds * Stopwatch.Frequency / 1000.0);
 
         public void Dispose() => Reset();
 
@@ -289,7 +466,14 @@ namespace PoECoop.Net
                         {
                             if (!_readyPeers.Contains(sender.Id)
                                 && reader.Type != MessageType.SaveLoaded && reader.Type != MessageType.WorldReady) break;
+                            if (reader.Type == MessageType.PerfProbe)
+                            {
+                                AnswerPerfPing(e.Connection, reader);
+                                break;
+                            }
+                            long perfStart = PerfStats.Begin();
                             GameMessage?.Invoke(sender, reader);
+                            PerfStats.NetDispatched((byte)reader.Type, perfStart);
                             break;
                         }
                         if (reader.Type != MessageType.Chat) throw new FormatException("unexpected " + reader.Type);
@@ -319,7 +503,7 @@ namespace PoECoop.Net
                 refusal = "game version differs: host has " + _gameVersion + ", you have " + gameVersion;
             if (refusal != null)
             {
-                _transport.Send(connection, new MessageWriter(MessageType.Reject).String(refusal).ToArray());
+                Transmit(connection, new MessageWriter(MessageType.Reject).String(refusal).ToArray());
                 // Not disconnected right away, so the reason has time to go out. The guest
                 // drops the link when it reads it; if it does not, this deadline closes it.
                 _awaitingHello[connection] = now + 2f;
@@ -335,7 +519,7 @@ namespace PoECoop.Net
             SendToGuests(new MessageWriter(MessageType.PlayerJoined).Int(player.Id).String(player.Name).ToArray());
             _byConnection[connection] = player;
             Players.Add(player);
-            _transport.Send(connection, welcome.ToArray());
+            Transmit(connection, welcome.ToArray());
             Status(player.Name + " joined from " + _transport.Describe(connection));
             PlayerJoined?.Invoke(player);
         }
@@ -368,7 +552,7 @@ namespace PoECoop.Net
             {
                 if (type >= MessageType.FirstGameMessage && !_readyPeers.Contains(pair.Value.Id)
                     && type != MessageType.SaveBegin && type != MessageType.SaveChunk && type != MessageType.WorldState) continue;
-                _transport.Send(pair.Key, message);
+                Transmit(pair.Key, message);
             }
         }
 
@@ -387,7 +571,7 @@ namespace PoECoop.Net
             switch (e.Type)
             {
                 case TransportEventType.Connected:
-                    _transport.Send(0, new MessageWriter(MessageType.Hello)
+                    Transmit(0, new MessageWriter(MessageType.Hello)
                         .Int(Protocol.Version).String(_modVersion).String(_gameVersion).String(LocalName).ToArray());
                     break;
 
@@ -458,9 +642,16 @@ namespace PoECoop.Net
                         throw new FormatException("unexpected " + reader.Type);
                     if (!_localWorldReady && reader.Type != MessageType.SaveBegin
                         && reader.Type != MessageType.SaveChunk && reader.Type != MessageType.WorldState) break;
-                    DevTools.UpdateTrace("message-" + reader.Type);
+                    if (reader.Type == MessageType.PerfProbe)
+                    {
+                        ReadPerfPong(reader);
+                        break;
+                    }
+                    DevTools.UpdateTrace("message-", reader.Type);
+                    long perfStart = PerfStats.Begin();
                     GameMessage?.Invoke(null, reader);
-                    DevTools.UpdateTrace("message-done-" + reader.Type);
+                    PerfStats.NetDispatched((byte)reader.Type, perfStart);
+                    DevTools.UpdateTrace("message-done-", reader.Type);
                     break;
             }
         }
@@ -482,7 +673,9 @@ namespace PoECoop.Net
 
         internal void SetLocalWorldReady(bool ready)
         {
-            if (IsGuest) _localWorldReady = ready;
+            if (!IsGuest) return;
+            if (ready && !_localWorldReady) _deferAllowedAt = Stopwatch.GetTimestamp() + ReadySettleTicks;
+            _localWorldReady = ready;
         }
 
         internal void RaiseWorldStateReady(PlayerInfo player, long worldEpoch)
@@ -492,6 +685,68 @@ namespace PoECoop.Net
         {
             if (!IsHost || (playerId >= 0 && !IsPeerReady(playerId))) return;
             FullStateRequested?.Invoke(playerId, worldEpoch);
+        }
+
+        /// <summary>Every send goes through here so traffic is counted per message type.</summary>
+        private void Transmit(int connection, byte[] message)
+        {
+            if (PerfStats.Enabled && message != null && message.Length > 0) PerfStats.NetSent(message[0], message.Length);
+            _transport.Send(connection, message);
+        }
+
+        // ---- diagnostics (--coop-perf) ----
+
+        private static void SampleIncomingQueue(ITransport transport)
+        {
+            var stats = transport as ITransportStats;
+            if (stats == null) return;
+            PerfStats.Gauge("net.queue.in_messages", stats.PendingIncomingMessages);
+            PerfStats.Gauge("net.queue.in_bytes", stats.PendingIncomingBytes);
+        }
+
+        private static void SampleOutgoingQueue(ITransport transport)
+        {
+            var stats = transport as ITransportStats;
+            if (stats == null) return;
+            PerfStats.Gauge("net.queue.out_messages", stats.PendingOutgoingMessages);
+            PerfStats.Gauge("net.queue.out_bytes", stats.PendingOutgoingBytes);
+        }
+
+        /// <summary>Guest: measures the round trip through both main threads, one ping at a time.</summary>
+        private void SendPerfPing(float now)
+        {
+            if (State != SessionState.Joined || !_localWorldReady) return;
+            if (_perfPingStamp != 0L)
+            {
+                if (now - _perfPingSentAt < PerfPingTimeoutSeconds) return;
+                _perfPingStamp = 0L;
+                PerfStats.Count("net.rtt_lost");
+            }
+            if (now < _nextPerfPing) return;
+            _nextPerfPing = now + PerfPingIntervalSeconds;
+            _perfPingSentAt = now;
+            _perfPingStamp = Stopwatch.GetTimestamp();
+            Transmit(0, new MessageWriter(MessageType.PerfProbe).Byte(PerfPing).Long(_perfPingStamp).ToArray());
+        }
+
+        /// <summary>Host: echoes a guest's ping whether or not diagnostics are on here.</summary>
+        private void AnswerPerfPing(int connection, MessageReader reader)
+        {
+            byte kind = reader.Byte();
+            long stamp = reader.Long();
+            reader.Finish();
+            if (kind != PerfPing) throw new FormatException("perf probe kind " + kind);
+            Transmit(connection, new MessageWriter(MessageType.PerfProbe).Byte(PerfPong).Long(stamp).ToArray());
+        }
+
+        private void ReadPerfPong(MessageReader reader)
+        {
+            byte kind = reader.Byte();
+            long stamp = reader.Long();
+            reader.Finish();
+            if (kind != PerfPong || stamp != _perfPingStamp || stamp == 0L) return;
+            _perfPingStamp = 0L;
+            PerfStats.Gauge("net.rtt_ms", (Stopwatch.GetTimestamp() - stamp) * 1000.0 / Stopwatch.Frequency);
         }
 
         private static MessageType SentType(byte[] message)
@@ -512,12 +767,16 @@ namespace PoECoop.Net
             Generation++;
             _transport?.Dispose();
             _transport = null;
+            // Undelivered events die with the connection they came from; none reach a later session.
+            ClearInbox();
             _byConnection.Clear();
             _awaitingHello.Clear();
             _readyPeers.Clear();
             _localWorldReady = false;
             Players.Clear();
             _nextPlayerId = 1;
+            _perfPingStamp = 0L;
+            _nextPerfPing = 0f;
             LocalId = 0;
             State = SessionState.Offline;
             SessionReset?.Invoke();

@@ -13,10 +13,16 @@ namespace PoECoop.Sync
     /// event lists, but applies them only after every actor, free action and cast
     /// attack in the snapshot can be resolved locally.
     ///
-    /// Wire layout after the type byte: epoch, sequence, full, mode, all static
-    /// round settings, manager flags, current event/phase/timers, turn locks,
-    /// actors, event records, then the exact ordered queue of event IDs. Sequence
-    /// gaps are repaired through TacticalOrders' semantic resync command.
+    /// Wire layout after the type byte: epoch, sequence, kind, then for a snapshot
+    /// (kind 0 or 1 = full) mode, all static round settings, manager flags,
+    /// current event/phase/timers, turn locks, actors, event records, then the
+    /// exact ordered queue of event IDs. Sequence gaps are repaired through
+    /// TacticalOrders' semantic resync command.
+    ///
+    /// Kind 2 is a timers-only update for the snapshot whose epoch and sequence it
+    /// names: a tick counter, the four manager timers and the turn-lock remaining
+    /// times. It does not consume a sequence number and is ignored by a guest that
+    /// does not hold exactly that snapshot.
     /// </summary>
     public sealed class TacticalStateSync : IDisposable
     {
@@ -32,6 +38,25 @@ namespace PoECoop.Sync
         private const float SendInterval = 0.05f;
         private const float FullRefreshInterval = 2f;
         private const float ResyncInterval = 0.5f;
+        // Applied after a forced refresh so this stream's periodic refresh does not
+        // share a frame with the other streams that were forced by the same event.
+        private const float RefreshPhaseOffset = 1.95f;
+        private const float MinResyncSpacing = 0.1f;
+        private const float ResolveRetryInterval = 0.1f;
+        private const float TimerInterval = 0.1f;
+        // A guest skips re-applying a byte-identical snapshot, but not for longer than this.
+        private const float IdenticalReapplyInterval = 10f;
+        // Message layout: type byte, epoch, sequence, kind, then the body.
+        private const int SequenceOffset = 5;
+        private const int BodyOffset = 10;
+        // Body: mode byte, 16 round settings, manager flags, current event ID and
+        // phase byte precede the four timers, the turn-lock count and its values.
+        private const int TimersOffset = BodyOffset + 1 + 16 * 4 + 4 + 4 + 1;
+        private const int TimersLength = 4 * 4;
+        private const int LockCountOffset = TimersOffset + TimersLength;
+        private const byte KindSnapshot = 0;
+        private const byte KindFull = 1;
+        private const byte KindTimers = 2;
         private const int MaxTurnLocks = 64;
         private const int MaxRound = 4096;
         private const int MaxInitiativeBias = 4096;
@@ -79,13 +104,37 @@ namespace PoECoop.Sync
         private readonly TacticalEventPresentation _presentation;
         private readonly Dictionary<TacticalEvent, int> _eventIds = new Dictionary<TacticalEvent, int>();
         private readonly HashSet<Guid> _knownActors = new HashSet<Guid>();
+        private readonly HashSet<TacticalEvent> _seenEvents = new HashSet<TacticalEvent>();
+        private readonly Dictionary<Guid, AIController> _captureActors = new Dictionary<Guid, AIController>();
+        private readonly List<Guid> _captureActorIds = new List<Guid>();
+        private readonly List<TacticalEvent> _staleEvents = new List<TacticalEvent>();
+        private readonly Dictionary<GenericAbility, AbilityKeyEntry> _abilityKeys = new Dictionary<GenericAbility, AbilityKeyEntry>();
+        private readonly Dictionary<TacticalEvent, CastAttackEntry> _castAttacks = new Dictionary<TacticalEvent, CastAttackEntry>();
+
+        private static readonly HashSet<Guid> s_readActorIds = new HashSet<Guid>();
+        private static readonly HashSet<int> s_readEventIds = new HashSet<int>();
+        private static readonly HashSet<int> s_readQueued = new HashSet<int>();
+        private static readonly List<float> s_readLocks = new List<float>();
 
         private long _generation;
         private bool _wasHost, _wasGuest;
         private int _epoch = 1, _sequence, _nextEventId = 1;
         private int _lastEpoch = -1, _lastSequence = -1;
         private float _nextSend, _nextFullRefresh, _nextResync, _nextCaptureWarning;
+        private float _lastResync = float.NegativeInfinity, _nextResolve;
+        // Host: timers-only updates sent for the snapshot numbered _sequence.
+        private float _nextTimers;
+        private int _timerTick;
+        // Guest: the snapshot the presentation currently shows, the body bytes it
+        // was decoded from (null once timers-only updates moved it on), and the
+        // last timers-only tick accepted for _lastSequence.
+        private int _appliedEpoch = -1, _appliedSequence = -1, _lastTimerTick;
+        private byte[] _appliedBody, _pendingBody;
+        private float _lastApply;
         private byte[] _lastSignature;
+        // Set only while _lastSignature is a Disabled-mode snapshot.
+        private TacticalSettings _idleSettings;
+        private bool _idleAutoPass;
         private TacticalSnapshot _pending;
 
         public static bool ApplyingHostState => s_applyDepth > 0;
@@ -101,6 +150,7 @@ namespace PoECoop.Sync
             s_instance = this;
             session.GameMessage += OnGameMessage;
             session.PlayerJoined += OnPlayerJoined;
+            session.WorldStateReady += OnWorldStateReady;
             GameState.OnLevelLoaded += OnLevelChanged;
             GameState.OnLevelUnload += OnLevelChanged;
             GameState.OnCombatStart += OnCombatChanged;
@@ -113,6 +163,7 @@ namespace PoECoop.Sync
             RequireMainThread();
             _session.GameMessage -= OnGameMessage;
             _session.PlayerJoined -= OnPlayerJoined;
+            _session.WorldStateReady -= OnWorldStateReady;
             GameState.OnLevelLoaded -= OnLevelChanged;
             GameState.OnLevelUnload -= OnLevelChanged;
             GameState.OnCombatStart -= OnCombatChanged;
@@ -121,6 +172,10 @@ namespace PoECoop.Sync
             _presentation.Dispose();
             _eventIds.Clear();
             _knownActors.Clear();
+            _seenEvents.Clear();
+            _captureActors.Clear();
+            _abilityKeys.Clear();
+            _castAttacks.Clear();
             _pending = null;
             if (s_instance == this)
             {
@@ -153,7 +208,7 @@ namespace PoECoop.Sync
             RequireMainThread();
             SyncSession();
             if (_session.IsHost) HostUpdate(now);
-            else if (_session.IsGuest) GuestUpdate();
+            else if (_session.IsGuest) GuestUpdate(now);
             else if (CurrentEpoch != 0 || CurrentEventId != 0)
             {
                 CurrentEpoch = 0;
@@ -179,10 +234,16 @@ namespace PoECoop.Sync
                 _lastSignature = null;
             }
             UpdateHostToken();
+            long started = PerfStats.Begin();
             TacticalSnapshot snapshot = Capture(true);
-            if (snapshot == null) return;
-            snapshot.Sequence = _sequence + 1;
-            byte[] data = Serialize(snapshot);
+            byte[] data = null;
+            if (snapshot != null)
+            {
+                snapshot.Sequence = _sequence + 1;
+                data = Serialize(snapshot);
+            }
+            PerfStats.End("tactical.capture", started);
+            if (data == null) return;
             if (data.Length > MaxSnapshotBytes)
             {
                 CaptureWarning("Tactical snapshot exceeded 256 KiB and was not sent");
@@ -190,8 +251,28 @@ namespace PoECoop.Sync
             }
             _session.SendToPlayer(playerId, data);
             _sequence = snapshot.Sequence;
+            PerfStats.Count("tactical.resync");
+            PerfStats.Count("tactical.full");
+            PerfStats.Count("tactical.records", snapshot.Actors.Count + snapshot.Events.Count);
+            if (_session.Players.Count == 2)
+            {
+                // The only guest now holds this exact sequence, so no other peer
+                // needs the repairing broadcast and later snapshots stay continuous.
+                Remember(snapshot, data);
+                _nextFullRefresh = Time.unscaledTime + FullRefreshInterval + RefreshPhaseOffset;
+                return;
+            }
             _lastSignature = null;
+            _idleSettings = null;
             _nextFullRefresh = 0f;
+        }
+
+        private void Remember(TacticalSnapshot snapshot, byte[] data)
+        {
+            _lastSignature = data;
+            _timerTick = 0;
+            _idleSettings = snapshot.Mode == TacticalMode.Disabled ? snapshot.Settings : null;
+            _idleAutoPass = snapshot.AutoPass;
         }
 
         private void RequireMainThread()
@@ -207,6 +288,7 @@ namespace PoECoop.Sync
             {
                 _generation = _session.Generation;
                 _pending = null;
+                _pendingBody = null;
                 _nextResync = 0f;
                 if (host) ResetHostStream();
                 else
@@ -222,6 +304,13 @@ namespace PoECoop.Sync
         private void OnPlayerJoined(PlayerInfo player)
         {
             if (_session.IsHost) SendLatestTo(player.Id);
+        }
+
+        // Game messages are withheld from a peer until its world is ready, so the
+        // join-time snapshot may never have reached it.
+        private void OnWorldStateReady(PlayerInfo player, long worldEpoch)
+        {
+            if (player != null && _session.IsHost) SendLatestTo(player.Id);
         }
 
         private void OnLevelChanged(object sender, EventArgs e)
@@ -250,11 +339,16 @@ namespace PoECoop.Sync
             AdvanceEpoch();
             _sequence = 0;
             _lastSignature = null;
+            _idleSettings = null;
             _eventIds.Clear();
             _knownActors.Clear();
+            _abilityKeys.Clear();
+            _castAttacks.Clear();
             _nextEventId = 1;
             _nextSend = 0f;
             _nextFullRefresh = 0f;
+            _nextTimers = 0f;
+            _timerTick = 0;
             CurrentEpoch = 0;
             CurrentEventId = 0;
         }
@@ -264,10 +358,23 @@ namespace PoECoop.Sync
             _lastEpoch = -1;
             _lastSequence = -1;
             _pending = null;
-            _nextResync = 0f;
+            _pendingBody = null;
+            ForgetApplied();
+            _lastTimerTick = 0;
+            _nextResolve = 0f;
+            // A reset may ask again promptly, but repeated resets cannot turn the
+            // resync request into a per-frame message.
+            _nextResync = Mathf.Min(_nextResync, _lastResync + MinResyncSpacing);
             CurrentEpoch = 0;
             CurrentEventId = 0;
             _presentation.Reset(true);
+        }
+
+        private void ForgetApplied()
+        {
+            _appliedEpoch = -1;
+            _appliedSequence = -1;
+            _appliedBody = null;
         }
 
         private void AdvanceEpoch()
@@ -284,24 +391,51 @@ namespace PoECoop.Sync
             _nextSend = now + SendInterval;
             if (_session.Players.Count < 2 || !CanCapture()) return;
 
-            bool full = now >= _nextFullRefresh || _lastSignature == null;
+            bool forced = _lastSignature == null || _nextFullRefresh <= 0f;
+            bool full = forced || now >= _nextFullRefresh;
+            if (!full && IdleUnchanged())
+            {
+                PerfStats.Count("tactical.skipped");
+                return;
+            }
+
+            long started = PerfStats.Begin();
             TacticalSnapshot snapshot = Capture(full);
-            if (snapshot == null) return;
-            byte[] signature = SerializeSignature(snapshot);
-            if (!full && SameBytes(signature, _lastSignature)) return;
+            byte[] data = null;
+            if (snapshot != null)
+            {
+                snapshot.Sequence = unchecked(_sequence + 1);
+                snapshot.Full = full;
+                data = Serialize(snapshot);
+            }
+            PerfStats.End("tactical.capture", started);
+            if (data == null) return;
+            if (!full)
+            {
+                if (SameSnapshot(data, _lastSignature))
+                {
+                    PerfStats.Count("tactical.skipped");
+                    return;
+                }
+                if (SameStructure(data, _lastSignature) && TimerLayoutMatches(data, snapshot))
+                {
+                    // Only timers moved since the snapshot the guests hold. Until the
+                    // rate limit allows an update, later ticks compare again.
+                    if (now >= _nextTimers) SendTimers(snapshot, data, now);
+                    return;
+                }
+            }
             if (_sequence == int.MaxValue)
             {
                 AdvanceEpoch();
                 _sequence = 0;
                 snapshot.Epoch = _epoch;
+                snapshot.Sequence = 1;
                 full = true;
                 snapshot.Full = true;
-                signature = SerializeSignature(snapshot);
+                data = Serialize(snapshot);
             }
 
-            snapshot.Sequence = _sequence + 1;
-            snapshot.Full = full;
-            byte[] data = Serialize(snapshot);
             if (data.Length > MaxSnapshotBytes)
             {
                 CaptureWarning("Tactical snapshot exceeded 256 KiB and was not sent");
@@ -309,8 +443,39 @@ namespace PoECoop.Sync
             }
             _session.SendToGuests(data);
             _sequence = snapshot.Sequence;
-            _lastSignature = signature;
-            if (full) _nextFullRefresh = now + FullRefreshInterval;
+            Remember(snapshot, data);
+            PerfStats.Count(full ? "tactical.full" : "tactical.delta");
+            PerfStats.Count("tactical.records", snapshot.Actors.Count + snapshot.Events.Count);
+            if (full) _nextFullRefresh = now + FullRefreshInterval + (forced ? RefreshPhaseOffset : 0f);
+        }
+
+        /// <summary>
+        /// Sends the timers of a snapshot whose structure equals the one numbered
+        /// _sequence, and remembers it as what the guests now hold.
+        /// </summary>
+        private void SendTimers(TacticalSnapshot snapshot, byte[] data, float now)
+        {
+            _timerTick = _timerTick == int.MaxValue ? 1 : _timerTick + 1;
+            var writer = new MessageWriter(MessageType.TacticalState)
+                .Int(_epoch).Int(_sequence).Byte(KindTimers).Int(_timerTick)
+                .Float(snapshot.CurrentTimer).Float(snapshot.RealTimer).Float(snapshot.SpinUpTimer).Float(snapshot.EffectTime)
+                .Int(snapshot.TurnLocks.Count);
+            foreach (float remaining in snapshot.TurnLocks) writer.Float(remaining);
+            _session.SendToGuests(writer.ToArray());
+            _lastSignature = data;
+            _nextTimers = now + TimerInterval;
+            PerfStats.Count("tactical.timers");
+        }
+
+        /// <summary>
+        /// True while tactical mode is off and nothing a Disabled snapshot carries
+        /// differs from the one last sent, so real-time play captures nothing.
+        /// </summary>
+        private bool IdleUnchanged()
+        {
+            if (_idleSettings == null || GameState.Option.TacticalMode != TacticalMode.Disabled) return false;
+            TacticalModeManager manager = TacticalModeManager.Instance;
+            return _idleAutoPass == (manager != null && manager.AutoPassTurns) && _idleSettings.MatchesCurrent();
         }
 
         private static bool CanCapture()
@@ -335,6 +500,13 @@ namespace PoECoop.Sync
         {
             try
             {
+                // Identity keys are recomputed on every full snapshot, so a cached
+                // key never outlives one refresh interval.
+                if (full)
+                {
+                    _abilityKeys.Clear();
+                    _castAttacks.Clear();
+                }
                 var settings = TacticalSettings.Capture();
                 if (GameState.Option.TacticalMode == TacticalMode.Disabled)
                 {
@@ -371,7 +543,8 @@ namespace PoECoop.Sync
 
                 IList<TacticalEvent> nativeEvents = manager.Events;
                 if (nativeEvents.Count > MaxEvents) throw new InvalidOperationException("native tactical queue exceeds sync bound");
-                var seen = new HashSet<TacticalEvent>();
+                HashSet<TacticalEvent> seen = _seenEvents;
+                seen.Clear();
                 for (int i = 0; i < nativeEvents.Count; i++)
                 {
                     TacticalEvent tacticalEvent = nativeEvents[i];
@@ -422,7 +595,8 @@ namespace PoECoop.Sync
 
         private void CaptureActors(TacticalModeManager manager, TacticalSnapshot snapshot)
         {
-            var actors = new Dictionary<Guid, AIController>();
+            Dictionary<Guid, AIController> actors = _captureActors;
+            actors.Clear();
             foreach (TacticalEventRecord record in snapshot.Events)
             {
                 if (record.ActorId == Guid.Empty || actors.ContainsKey(record.ActorId)) continue;
@@ -448,7 +622,9 @@ namespace PoECoop.Sync
             }
             if (actors.Count > MaxActors) throw new InvalidOperationException("tactical actor count exceeds sync bound");
 
-            var ids = new List<Guid>(actors.Keys);
+            List<Guid> ids = _captureActorIds;
+            ids.Clear();
+            ids.AddRange(actors.Keys);
             ids.Sort((a, b) => a.CompareTo(b));
             _knownActors.Clear();
             foreach (Guid id in ids)
@@ -459,9 +635,10 @@ namespace PoECoop.Sync
                 snapshot.Actors.Add(CaptureActor(id, actor, stats));
                 _knownActors.Add(id);
             }
+            actors.Clear();
         }
 
-        private static TacticalActorRecord CaptureActor(Guid id, AIController actor, CharacterStats stats)
+        private TacticalActorRecord CaptureActor(Guid id, AIController actor, CharacterStats stats)
         {
             var record = new TacticalActorRecord
             {
@@ -486,7 +663,7 @@ namespace PoECoop.Sync
                 foreach (GenericAbility ability in freeActions)
                 {
                     if (ability == null) continue;
-                    record.FreeActions.Add(CaptureAbilityKey(stats, ability));
+                    record.FreeActions.Add(CachedAbilityKey(stats, ability));
                 }
             }
             return record;
@@ -531,7 +708,7 @@ namespace PoECoop.Sync
                 if (cast.Attack == null) throw new InvalidOperationException("cast event has no attack");
                 record.SurpriseRound = cast.IsSurpriseRound;
                 record.AttackTime = BoundedTimer(cast.AttackTime);
-                record.Attack = CaptureAttackIdentity(cast.Actor, cast.Attack);
+                record.Attack = CachedAttackIdentity(cast);
             }
             return record;
         }
@@ -566,10 +743,16 @@ namespace PoECoop.Sync
         private void PruneEventIds(HashSet<TacticalEvent> seen)
         {
             if (_eventIds.Count == seen.Count) return;
-            var stale = new List<TacticalEvent>();
+            List<TacticalEvent> stale = _staleEvents;
+            stale.Clear();
             foreach (TacticalEvent tacticalEvent in _eventIds.Keys)
                 if (!seen.Contains(tacticalEvent)) stale.Add(tacticalEvent);
-            foreach (TacticalEvent tacticalEvent in stale) _eventIds.Remove(tacticalEvent);
+            foreach (TacticalEvent tacticalEvent in stale)
+            {
+                _eventIds.Remove(tacticalEvent);
+                _castAttacks.Remove(tacticalEvent);
+            }
+            stale.Clear();
         }
 
         // ---- wire ----
@@ -577,14 +760,7 @@ namespace PoECoop.Sync
         private static byte[] Serialize(TacticalSnapshot snapshot)
         {
             var writer = new MessageWriter(MessageType.TacticalState)
-                .Int(snapshot.Epoch).Int(snapshot.Sequence).Byte((byte)(snapshot.Full ? 1 : 0));
-            WriteBody(writer, snapshot);
-            return writer.ToArray();
-        }
-
-        private static byte[] SerializeSignature(TacticalSnapshot snapshot)
-        {
-            var writer = new MessageWriter(MessageType.TacticalState).Int(snapshot.Epoch).Int(0).Byte(0);
+                .Int(snapshot.Epoch).Int(snapshot.Sequence).Byte(snapshot.Full ? KindFull : KindSnapshot);
             WriteBody(writer, snapshot);
             return writer.ToArray();
         }
@@ -656,7 +832,39 @@ namespace PoECoop.Sync
             RequireMainThread();
             if (reader.Type != MessageType.TacticalState || sender != null || !_session.IsGuest) return;
 
-            TacticalSnapshot snapshot = ReadSnapshot(reader);
+            long started = PerfStats.Begin();
+            TacticalSnapshot snapshot = null;
+            byte[] body = null;
+            try
+            {
+                int epoch = reader.Int(), sequence = reader.Int();
+                if (epoch <= 0 || sequence <= 0) throw new FormatException("tactical epoch/sequence");
+                byte kind = reader.Byte();
+                if (kind > KindTimers) throw new FormatException("tactical message kind");
+                if (kind == KindTimers)
+                {
+                    ReceiveTimers(reader, epoch, sequence);
+                    return;
+                }
+                bool full = kind == KindFull;
+                bool acceptable = epoch == _lastEpoch && sequence > _lastSequence && (full || sequence == _lastSequence + 1);
+                body = reader.PeekRemainingBytes();
+                // The same bytes were validated and applied before, and nothing has
+                // been written over them since: take the sequence, keep the state.
+                if (acceptable && _pending == null && _appliedBody != null && _appliedEpoch == epoch
+                    && _appliedSequence == _lastSequence && Time.unscaledTime - _lastApply < IdenticalReapplyInterval
+                    && SameBytes(body, _appliedBody))
+                {
+                    _lastSequence = sequence;
+                    _appliedSequence = sequence;
+                    _lastTimerTick = 0;
+                    PerfStats.Count("tactical.skipped");
+                    return;
+                }
+                snapshot = ReadSnapshot(reader, epoch, sequence, full);
+                reader.Finish();
+            }
+            finally { PerfStats.End("tactical.update", started); }
             if (snapshot.Epoch < _lastEpoch || snapshot.Epoch == _lastEpoch && snapshot.Sequence <= _lastSequence) return;
             bool continuous = snapshot.Epoch == _lastEpoch && snapshot.Sequence == _lastSequence + 1;
             bool initialFull = snapshot.Epoch != _lastEpoch && snapshot.Full;
@@ -671,26 +879,70 @@ namespace PoECoop.Sync
             {
                 CurrentEpoch = 0;
                 CurrentEventId = 0;
+                ForgetApplied();
                 _presentation.Reset(true);
             }
             _lastEpoch = snapshot.Epoch;
             _lastSequence = snapshot.Sequence;
+            _lastTimerTick = 0;
             _pending = snapshot;
+            _pendingBody = body;
+            _nextResolve = 0f;
         }
 
-        private static TacticalSnapshot ReadSnapshot(MessageReader reader)
+        /// <summary>
+        /// Applies a timers-only update to the snapshot it names. Without exactly
+        /// that snapshot here it is dropped; the next complete snapshot or the
+        /// resync it triggers carries the timers again.
+        /// </summary>
+        private void ReceiveTimers(MessageReader reader, int epoch, int sequence)
         {
-            int epoch = reader.Int(), sequence = reader.Int();
-            if (epoch <= 0 || sequence <= 0) throw new FormatException("tactical epoch/sequence");
-            byte full = reader.Byte();
-            if (full > 1) throw new FormatException("tactical full flag");
+            int tick = reader.Int();
+            if (tick <= 0) throw new FormatException("tactical timer tick");
+            float currentTimer = ReadTimer(reader), realTimer = ReadTimer(reader);
+            float spinUpTimer = ReadTimer(reader), effectTime = ReadTimer(reader);
+            int lockCount = reader.Int();
+            CheckCount(lockCount, MaxTurnLocks, "turn locks");
+            List<float> locks = s_readLocks;
+            locks.Clear();
+            for (int i = 0; i < lockCount; i++) locks.Add(ReadTimer(reader));
+            reader.Finish();
+
+            if (epoch != _lastEpoch || sequence != _lastSequence || tick <= _lastTimerTick) return;
+            _lastTimerTick = tick;
+            if (_pending != null)
+            {
+                // Not applied yet: it will be applied with the newest timers.
+                TacticalSnapshot pending = _pending;
+                if (pending.Mode == TacticalMode.Disabled || pending.TurnLocks.Count != lockCount) return;
+                pending.CurrentTimer = currentTimer;
+                pending.RealTimer = realTimer;
+                pending.SpinUpTimer = spinUpTimer;
+                pending.EffectTime = effectTime;
+                for (int i = 0; i < lockCount; i++) pending.TurnLocks[i] = locks[i];
+                _pendingBody = null;
+                return;
+            }
+            if (_appliedEpoch != epoch || _appliedSequence != sequence || !Plugin.IsMirroring) return;
+            bool applied;
+            using (HostApplyScope())
+            {
+                applied = _presentation.ApplyTimers(currentTimer, realTimer, spinUpTimer, effectTime, locks);
+            }
+            if (!applied) return;
+            _appliedBody = null;
+            PerfStats.Count("tactical.timers");
+        }
+
+        private static TacticalSnapshot ReadSnapshot(MessageReader reader, int epoch, int sequence, bool full)
+        {
             byte mode = reader.Byte();
             if (mode > (byte)TacticalMode.RoundBased) throw new FormatException("tactical mode " + mode);
             var snapshot = new TacticalSnapshot
             {
                 Epoch = epoch,
                 Sequence = sequence,
-                Full = full != 0,
+                Full = full,
                 Mode = (TacticalMode)mode,
                 Settings = TacticalSettings.Read(reader),
             };
@@ -721,7 +973,8 @@ namespace PoECoop.Sync
 
             int actorCount = reader.Int();
             CheckCount(actorCount, MaxActors, "actors");
-            var actorIds = new HashSet<Guid>();
+            HashSet<Guid> actorIds = s_readActorIds;
+            actorIds.Clear();
             for (int i = 0; i < actorCount; i++)
             {
                 TacticalActorRecord actor = ReadActor(reader);
@@ -731,7 +984,8 @@ namespace PoECoop.Sync
 
             int eventCount = reader.Int();
             CheckCount(eventCount, MaxEvents, "events");
-            var eventIds = new HashSet<int>();
+            HashSet<int> eventIds = s_readEventIds;
+            eventIds.Clear();
             for (int i = 0; i < eventCount; i++)
             {
                 TacticalEventRecord record = ReadEvent(reader, actorIds);
@@ -741,7 +995,8 @@ namespace PoECoop.Sync
 
             int queueCount = reader.Int();
             CheckCount(queueCount, MaxEvents, "event queue");
-            var queued = new HashSet<int>();
+            HashSet<int> queued = s_readQueued;
+            queued.Clear();
             for (int i = 0; i < queueCount; i++)
             {
                 int id = reader.Int();
@@ -891,25 +1146,48 @@ namespace PoECoop.Sync
             float now = Time.unscaledTime;
             if (now < _nextResync) return;
             _nextResync = now + ResyncInterval;
+            _lastResync = now;
+            PerfStats.Count("tactical.resync");
             TacticalOrders.CaptureResync();
         }
 
         // ---- guest dependency resolution ----
 
-        private void GuestUpdate()
+        private void GuestUpdate(float now)
         {
-            if (!Plugin.IsMirroring || _pending == null) return;
+            if (_pending == null || now < _nextResolve || !Plugin.IsMirroring) return;
             TacticalSnapshot snapshot = _pending;
-            if (!TryResolve(snapshot, out TacticalResolvedSnapshot resolved)) return;
-            bool applied;
-            using (HostApplyScope())
+            long started = PerfStats.Begin();
+            bool applied = false;
+            try
             {
-                applied = _presentation.Apply(resolved);
+                if (TryResolve(snapshot, out TacticalResolvedSnapshot resolved))
+                {
+                    using (HostApplyScope())
+                    {
+                        applied = _presentation.Apply(resolved);
+                    }
+                }
             }
-            if (!applied) return;
+            finally { PerfStats.End("tactical.apply", started); }
+            if (!applied)
+            {
+                // The same snapshot fails the same way until its actors exist here;
+                // a newer snapshot clears the delay.
+                _nextResolve = now + ResolveRetryInterval;
+                PerfStats.Count("tactical.retry");
+                return;
+            }
+            PerfStats.Count(snapshot.Full ? "tactical.full" : "tactical.delta");
+            PerfStats.Count("tactical.records", snapshot.Actors.Count + snapshot.Events.Count);
             CurrentEpoch = snapshot.Mode == TacticalMode.Disabled ? 0 : snapshot.Epoch;
             CurrentEventId = snapshot.Mode == TacticalMode.Disabled ? 0 : snapshot.CurrentEventId;
+            _appliedEpoch = snapshot.Epoch;
+            _appliedSequence = snapshot.Sequence;
+            _appliedBody = _pendingBody;
+            _lastApply = Time.unscaledTime;
             _pending = null;
+            _pendingBody = null;
         }
 
         private static bool TryResolve(TacticalSnapshot snapshot, out TacticalResolvedSnapshot resolved)
@@ -984,6 +1262,49 @@ namespace PoECoop.Sync
         }
 
         // ---- shared identity and bounds ----
+
+        private struct AbilityKeyEntry
+        {
+            public CharacterStats Stats;
+            public int AbilityCount;
+            public TacticalAbilityKey Key;
+        }
+
+        private struct CastAttackEntry
+        {
+            public AIController Actor;
+            public AttackBase Attack;
+            public int AbilityCount;
+            public TacticalAttackIdentity Identity;
+        }
+
+        private static int AbilityCount(CharacterStats stats)
+        {
+            IList<GenericAbility> abilities = (object)stats != null ? stats.ActiveAbilities : null;
+            return abilities != null ? abilities.Count : -1;
+        }
+
+        private TacticalAbilityKey CachedAbilityKey(CharacterStats stats, GenericAbility ability)
+        {
+            int count = AbilityCount(stats);
+            if (_abilityKeys.TryGetValue(ability, out AbilityKeyEntry entry)
+                && ReferenceEquals(entry.Stats, stats) && entry.AbilityCount == count) return entry.Key;
+            TacticalAbilityKey key = CaptureAbilityKey(stats, ability);
+            _abilityKeys[ability] = new AbilityKeyEntry { Stats = stats, AbilityCount = count, Key = key };
+            return key;
+        }
+
+        private TacticalAttackIdentity CachedAttackIdentity(TacticalCastFinishedEvent cast)
+        {
+            AIController actor = cast.Actor;
+            AttackBase attack = cast.Attack;
+            int count = (object)actor != null ? AbilityCount(actor.CharacterStats) : -1;
+            if (_castAttacks.TryGetValue(cast, out CastAttackEntry entry) && ReferenceEquals(entry.Actor, actor)
+                && ReferenceEquals(entry.Attack, attack) && entry.AbilityCount == count) return entry.Identity;
+            TacticalAttackIdentity identity = CaptureAttackIdentity(actor, attack);
+            _castAttacks[cast] = new CastAttackEntry { Actor = actor, Attack = attack, AbilityCount = count, Identity = identity };
+            return identity;
+        }
 
         private static TacticalAbilityKey CaptureAbilityKey(CharacterStats stats, GenericAbility ability)
         {
@@ -1067,10 +1388,54 @@ namespace PoECoop.Sync
         }
 
         private static bool Finite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
+        /// <summary>Compares two serialized snapshots, ignoring the sequence and full flag.</summary>
+        private static bool SameSnapshot(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length || a.Length < BodyOffset) return false;
+            for (int i = 0; i < SequenceOffset; i++) if (a[i] != b[i]) return false;
+            for (int i = BodyOffset; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// True when two serialized snapshots differ at most in sequence, full
+        /// flag, the four manager timers and the turn-lock remaining times.
+        /// </summary>
+        private static bool SameStructure(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length || a.Length < LockCountOffset + 4) return false;
+            for (int i = 0; i < SequenceOffset; i++) if (a[i] != b[i]) return false;
+            for (int i = BodyOffset; i < TimersOffset; i++) if (a[i] != b[i]) return false;
+            for (int i = LockCountOffset; i < LockCountOffset + 4; i++) if (a[i] != b[i]) return false;
+            int locks = a[LockCountOffset] | a[LockCountOffset + 1] << 8 | a[LockCountOffset + 2] << 16 | a[LockCountOffset + 3] << 24;
+            if (locks < 0 || locks > MaxTurnLocks) return false;
+            int rest = LockCountOffset + 4 + locks * 4;
+            if (rest > a.Length) return false;
+            for (int i = rest; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// Confirms that the bytes SameStructure skipped are this snapshot's timers,
+        /// so a layout change can never hide a structural difference.
+        /// </summary>
+        private static bool TimerLayoutMatches(byte[] data, TacticalSnapshot snapshot)
+        {
+            if (!BitConverter.IsLittleEndian || data.Length < LockCountOffset + 4 + snapshot.TurnLocks.Count * 4) return false;
+            if (BitConverter.ToSingle(data, TimersOffset) != snapshot.CurrentTimer
+                || BitConverter.ToSingle(data, TimersOffset + 4) != snapshot.RealTimer
+                || BitConverter.ToSingle(data, TimersOffset + 8) != snapshot.SpinUpTimer
+                || BitConverter.ToSingle(data, TimersOffset + 12) != snapshot.EffectTime
+                || BitConverter.ToInt32(data, LockCountOffset) != snapshot.TurnLocks.Count) return false;
+            for (int i = 0; i < snapshot.TurnLocks.Count; i++)
+                if (BitConverter.ToSingle(data, LockCountOffset + 4 + i * 4) != snapshot.TurnLocks[i]) return false;
+            return true;
+        }
+
         private static bool SameBytes(byte[] a, byte[] b)
         {
-            if (a == b) return true;
-            if (a == null || b == null || a.Length != b.Length) return false;
+            if (a.Length != b.Length) return false;
             for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
             return true;
         }
@@ -1137,6 +1502,27 @@ namespace PoECoop.Sync
                 MovementTimePerRound = TacticalModeSettingsComponent.MovementTimePerRound,
                 ImmediateTimeThreshold = TacticalModeSettingsComponent.ImmediateTimeThreshold,
             };
+        }
+
+        /// <summary>True when the live round settings still equal this capture.</summary>
+        public bool MatchesCurrent()
+        {
+            return EffectTimePerRound == TacticalModeSettingsComponent.EffectTimePerRound
+                && EnterCombatBaseRecovery == TacticalModeSettingsComponent.EnterCombatBaseRecovery
+                && DelayTurnStep == TacticalModeSettingsComponent.DelayTurnStep
+                && NextTurnStep == TacticalModeSettingsComponent.NextTurnStep
+                && BaseRecovery == TacticalModeSettingsComponent.BaseRecovery
+                && PostBaseRecovery == TacticalModeSettingsComponent.PostBaseRecovery
+                && RecoveryMultiplier == TacticalModeSettingsComponent.BaseRecoveryMultiplier
+                && ReloadMultiplier == TacticalModeSettingsComponent.ReloadMultiplier
+                && VisibleRounds == TacticalModeSettingsComponent.VisibleRounds
+                && WeakestInterrupt == TacticalModeSettingsComponent.WeakestTacticalInterupt
+                && AverageInterrupt == TacticalModeSettingsComponent.AverageTacticalInterupt
+                && StrongestInterrupt == TacticalModeSettingsComponent.StrongestTacticalInterupt
+                && IntellectDurationBonus == TacticalModeSettingsComponent.TacticalIntellectDurationBonus
+                && DualWieldingMultiplier == TacticalModeSettingsComponent.TacticalDualWieldingMult
+                && MovementTimePerRound == TacticalModeSettingsComponent.MovementTimePerRound
+                && ImmediateTimeThreshold == TacticalModeSettingsComponent.ImmediateTimeThreshold;
         }
 
         public void Write(MessageWriter writer)

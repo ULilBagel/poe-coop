@@ -38,6 +38,19 @@ namespace PoECoop.Patches
         }
     }
 
+    /// <summary>
+    /// Lets the host sample new actors without scanning the scene every tick. A
+    /// prefix, because the native Start can throw for an actor without stats.
+    /// </summary>
+    [HarmonyPatch(typeof(Health), "Start")]
+    internal static class Health_Start_TrackVitals
+    {
+        private static void Prefix(Health __instance)
+        {
+            VitalsSync.Track(__instance);
+        }
+    }
+
     /// <summary>Downed actors stay out of the native tactical schedule until they are revived.</summary>
     [HarmonyPatch(typeof(TacticalModeManager), nameof(TacticalModeManager.EnterCombat))]
     internal static class TacticalModeManager_EnterCombat_DownedGuard

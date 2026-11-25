@@ -18,6 +18,11 @@ game="${GAME_DIR:-$HOME/snap/steam/common/.local/share/Steam/steamapps/common/Pi
 dev="$repo/.dev"
 mkdir -p "$dev"
 
+# An install with only the Windows build runs through Proton instead.
+if [ ! -e "$game/PillarsOfEternity" ] && [ -f "$game/PillarsOfEternity.exe" ]; then
+    exec "$repo/scripts/run-instance-proton.sh" "$role" "$@"
+fi
+
 # Unity refuses a second copy while boot.config has a single-instance line.
 grep -v '^single-instance' "$game/PillarsOfEternity_Data/boot.config" > "$dev/boot.config"
 

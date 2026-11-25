@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using HarmonyLib;
 using PoECoop.Net;
@@ -13,12 +15,28 @@ namespace PoECoop.Sync
     /// Reconciles the host's complete, ordered effect list for each target. Guest
     /// effects are real StatusEffect objects, but are inserted without ApplyEffect
     /// or ClearEffect so they are data for the UI, never a second simulation.
+    /// A manifest carries a target's structure (identity and every field that does not
+    /// advance with time) followed by its timer values; while the structure is unchanged
+    /// the host sends only the timer values that moved.
     /// </summary>
     public sealed class StatusEffectSync : IDisposable
     {
         private const float SendInterval = 0.25f;
         private const float FullRefreshInterval = 3f;
         private const float GuestRetryInterval = 0.25f;
+        private const float MaxGuestRetryInterval = 1f;
+        /// <summary>Keeps the first periodic refresh after a forced one out of phase with the other snapshot streams.</summary>
+        private const float ForcedRefreshPhase = 1.35f;
+        /// <summary>Manifest body header: tag, effect count, structure revision, structure byte count.</summary>
+        private const int TargetHeaderBytes = 13;
+        private const int StructureRevisionOffset = 5;
+        private const int StructureLengthOffset = 9;
+        /// <summary>Time active, interval timer and interval count of one effect.</summary>
+        private const int TimerBytesPerEffect = 12;
+        /// <summary>First byte of a values-only target body; a manifest body starts with the message type.</summary>
+        private const byte ValuesBodyTag = 0xF0;
+        private const int ValuesHeaderBytes = 9;
+        private const int MaxValuesEntryBytes = 14;
         private const int MaxTargets = 512;
         private const int MaxTargetsPerMessage = 128;
         private const int MaxEffectsPerTarget = 256;
@@ -63,13 +81,76 @@ namespace PoECoop.Sync
         private static readonly FieldInfo RemovedEvent = typeof(CharacterStats).GetField("OnClearStatusEffect", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly PropertyInfo CleanedUpProperty = typeof(StatusEffectParams).GetProperty("IsCleanedUp");
         private static readonly PropertyInfo MergedValueProperty = typeof(StatusEffectParams).GetProperty("MergedValue");
+        private static readonly Action<StatusEffectParams, bool> SetCleanedUp = CreateSetter<bool>(CleanedUpProperty);
+        private static readonly Action<StatusEffectParams, float> SetMergedValue = CreateSetter<float>(MergedValueProperty);
+        private static readonly StatusEffectTrigger DefaultTrigger = new StatusEffectTrigger();
+        private static readonly StatusEffectLevelScaling DefaultScaling = new StatusEffectLevelScaling();
+        private static readonly byte[] EmptyTargetBody = { (byte)MessageType.StatusEffects, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        private static readonly HashSet<int> AbilityTypes = EnumValues(typeof(GenericAbility.AbilityType));
+        private static readonly HashSet<int> ApplyTypes = EnumValues(typeof(StatusEffect.ApplyType));
+        private static readonly HashSet<int> ModifiedStats = EnumValues(typeof(StatusEffect.ModifiedStat));
+        private static readonly HashSet<int> DamageTypes = EnumValues(typeof(DamagePacket.DamageType));
+        private static readonly HashSet<int> IntervalRates = EnumValues(typeof(StatusEffectParams.IntervalRateType));
+        private static readonly HashSet<int> Races = EnumValues(typeof(CharacterStats.Race));
+        private static readonly HashSet<int> Classes = EnumValues(typeof(CharacterStats.Class));
+        private static readonly HashSet<int> AttributeTypes = EnumValues(typeof(CharacterStats.AttributeScoreType));
+        private static readonly HashSet<int> DefenseTypes = EnumValues(typeof(CharacterStats.DefenseType));
+        private static readonly HashSet<int> EquipmentSlots = EnumValues(typeof(Equippable.EquipmentSlot));
+        private static readonly HashSet<int> TriggerTypes = EnumValues(typeof(StatusEffectTrigger.TriggerType));
+
+        // Lookups that are stable for one host sample or one guest reconciliation pass.
+        // They are cleared at both ends of the pass, so nothing outlives the frame.
+        private static class Children<T> where T : Component
+        {
+            internal static readonly Dictionary<int, T[]> ByOwner = new Dictionary<int, T[]>();
+        }
+        private static readonly Dictionary<int, string> s_passNames = new Dictionary<int, string>();
+        private static readonly Dictionary<int, Guid> s_passIds = new Dictionary<int, Guid>();
+        private static readonly Dictionary<int, Phrase[]> s_passKnownPhrases = new Dictionary<int, Phrase[]>();
+        private static readonly List<Affliction> s_passAfflictions = new List<Affliction>();
+        private static bool s_passAfflictionsBuilt;
+        private static FieldInfo[] s_afflictionFields;
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct GuidBits
+        {
+            [FieldOffset(0)] public Guid Value;
+            [FieldOffset(0)] public long Low;
+            [FieldOffset(8)] public long High;
+        }
 
         private static int s_applyingHostStatus;
         internal static bool ApplyingHostStatus => s_applyingHostStatus != 0;
 
         private readonly Session _session;
         private readonly Action<PlayerInfo> _playerJoined;
-        private readonly Dictionary<Guid, byte[]> _sent = new Dictionary<Guid, byte[]>();
+        private readonly Dictionary<Guid, HostTarget> _sent = new Dictionary<Guid, HostTarget>();
+        private readonly HashSet<Guid> _current = new HashSet<Guid>();
+        private readonly List<Outgoing> _changed = new List<Outgoing>();
+        private readonly List<Guid> _missing = new List<Guid>();
+        private readonly List<StatusEffect> _captureEffects = new List<StatusEffect>();
+        private readonly MemoryStream _valuesStream = new MemoryStream(1024);
+        private readonly BinaryWriter _valuesWriter;
+        private int _structureRevision;
+        private readonly Dictionary<int, string> _sortNames = new Dictionary<int, string>();
+        private const float SetCheckInterval = 30f;
+        private static readonly List<CharacterStats> s_enabled = new List<CharacterStats>();
+        private static readonly HashSet<int> s_enabledIds = new HashSet<int>();
+        private static bool s_enabledSeeded;
+        private static bool s_enabledDrifted;
+        private readonly HashSet<int> _scratchInstances = new HashSet<int>();
+        private CharacterStats[] _targets = new CharacterStats[64];
+        private float _nextSetCheck;
+        private string[] _sortKeys = new string[64];
+        private readonly MemoryStream _captureStream = new MemoryStream(4096);
+        private readonly BinaryWriter _captureWriter;
+        private readonly List<int> _effectEnds = new List<int>();
+        private readonly MemoryStream _messageStream = new MemoryStream(4096);
+        private readonly BinaryWriter _messageWriter;
+        private readonly HashSet<uint> _scratchIds = new HashSet<uint>();
+        private readonly List<uint> _scratchAbsent = new List<uint>();
+        private readonly OriginReferences _origins = new OriginReferences();
         private readonly HashSet<string> _hostWarnings = new HashSet<string>();
         private readonly Dictionary<Guid, GuestTarget> _guestTargets = new Dictionary<Guid, GuestTarget>();
         private readonly HashSet<string> _guestWarnings = new HashSet<string>();
@@ -80,14 +161,61 @@ namespace PoECoop.Sync
         private int _revision;
         private int _guestEpoch = int.MinValue;
         private int _guestRevision;
-        private Dictionary<Guid, GuestTarget> _fullStaging;
+        private Dictionary<Guid, Incoming> _fullStaging;
+
+        /// <summary>What the guests hold for one target: the last manifest and the timer values sent since.</summary>
+        private sealed class HostTarget
+        {
+            public CharacterStats Stats;
+            public byte[] Body;
+            public int StructureRevision;
+            /// <summary>Hash of the cheap structural inputs sampled when the structure was last serialised.</summary>
+            public ulong Signature;
+            /// <summary>The effects of the manifest, in manifest order.</summary>
+            public StatusEffect[] Effects = new StatusEffect[8];
+            public float[] TimeActive = new float[8];
+            public float[] IntervalTimer = new float[8];
+            public uint[] IntervalCount = new uint[8];
+            public int Count;
+            /// <summary>The whole live list at that time, including effects the manifest had to omit.</summary>
+            public StatusEffect[] Live = new StatusEffect[8];
+            public int LiveCount;
+        }
+
+        /// <summary>One target body to send: a manifest array, or a values-only span of the values buffer when Body is null.</summary>
+        private struct Outgoing
+        {
+            public Guid Id;
+            public byte[] Body;
+            public int Offset;
+            public int Length;
+        }
 
         private sealed class GuestTarget
         {
             public List<EffectRecord> Records = new List<EffectRecord>();
             public readonly Dictionary<uint, MirrorEffect> Effects = new Dictionary<uint, MirrorEffect>();
+            /// <summary>The host's encoded manifest that Records was parsed from, with later timer values written in.</summary>
+            public byte[] Raw;
             public bool Dirty = true;
             public bool Initialized;
+            /// <summary>An identical manifest arrived for an applied target; check that the live list still matches.</summary>
+            public bool Verify;
+            public GameObject AppliedObject;
+            public CharacterStats AppliedStats;
+            public int Failures;
+            public float NextRetry;
+        }
+
+        /// <summary>
+        /// One target of a received message. Records is null for a values-only body and while a
+        /// manifest has the structure the target already holds.
+        /// </summary>
+        private sealed class Incoming
+        {
+            public byte[] Raw;
+            public List<EffectRecord> Records;
+            public bool Values;
         }
 
         private sealed class MirrorEffect
@@ -105,6 +233,9 @@ namespace PoECoop.Sync
         public StatusEffectSync(Session session)
         {
             _session = session;
+            _captureWriter = new BinaryWriter(_captureStream, Encoding.UTF8);
+            _messageWriter = new BinaryWriter(_messageStream, Encoding.UTF8);
+            _valuesWriter = new BinaryWriter(_valuesStream, Encoding.UTF8);
             session.GameMessage += OnGameMessage;
             _playerJoined = _ => _nextFullRefresh = 0f;
             session.PlayerJoined += _playerJoined;
@@ -122,14 +253,22 @@ namespace PoECoop.Sync
             _guestTargets.Clear();
             _fullStaging = null;
             _sent.Clear();
+            _current.Clear();
+            _changed.Clear();
+            _sortNames.Clear();
+            ClearPassLookups();
         }
 
         private void OnLevelLoaded(object sender, EventArgs e)
         {
             _sent.Clear();
+            _current.Clear();
+            _changed.Clear();
+            _sortNames.Clear();
             _hostWarnings.Clear();
             _nextSend = 0f;
             _nextFullRefresh = 0f;
+            _nextSetCheck = 0f;
             if (_session.IsHost)
             {
                 _epoch = unchecked(_epoch + 1);
@@ -156,8 +295,48 @@ namespace PoECoop.Sync
             }
             if (GameState.IsLoading || now < _nextGuestRetry) return;
             _nextGuestRetry = now + GuestRetryInterval;
-            foreach (var pair in _guestTargets)
-                if (pair.Value.Dirty) ReconcileTarget(pair.Key, pair.Value);
+            if (_guestTargets.Count == 0) return;
+
+            long started = PerfStats.Begin();
+            ClearPassLookups();
+            try
+            {
+                foreach (var pair in _guestTargets)
+                {
+                    GuestTarget target = pair.Value;
+                    if (!target.Dirty)
+                    {
+                        if (!target.Verify) continue;
+                        target.Verify = false;
+                        if (StillApplied(pair.Key, target))
+                        {
+                            PerfStats.Count("status.skipped");
+                            continue;
+                        }
+                    }
+                    else if (now < target.NextRetry) continue;
+
+                    bool effectFailure = ReconcileTarget(pair.Key, target);
+                    PerfStats.Count("status.records");
+                    if (!target.Dirty || !effectFailure)
+                    {
+                        // An unresolved target costs two dictionary lookups, so it keeps the base cadence.
+                        target.Failures = 0;
+                        target.NextRetry = 0f;
+                        continue;
+                    }
+                    // Effects whose owner or origin stays unresolved repeat the whole origin search;
+                    // back off 0.25 s, 0.5 s, then 1 s until the host sends this target again.
+                    if (target.Failures < 3) target.Failures++;
+                    target.NextRetry = now + Math.Min(MaxGuestRetryInterval, GuestRetryInterval * (1 << (target.Failures - 1))) - 0.05f;
+                    PerfStats.Count("status.retry");
+                }
+            }
+            finally
+            {
+                ClearPassLookups();
+                PerfStats.End("status.update", started);
+            }
         }
 
         // ---- host sampling and wire output ----
@@ -168,116 +347,533 @@ namespace PoECoop.Sync
             _nextSend = now + SendInterval;
             if (_session.Players.Count < 2 || !GameState.IsInGameSession || GameState.IsLoading) return;
 
+            long started = PerfStats.Begin();
             bool full = now >= _nextFullRefresh;
-            if (full) _nextFullRefresh = now + FullRefreshInterval;
-
-            var current = new Dictionary<Guid, byte[]>();
-            CharacterStats[] all = UnityEngine.Object.FindObjectsOfType<CharacterStats>();
-            Array.Sort(all, (a, b) => string.CompareOrdinal(a.name, b.name));
-            int accepted = 0;
-            for (int i = 0; i < all.Length && accepted < MaxTargets; i++)
+            if (full)
             {
-                CharacterStats stats = all[i];
-                if (stats == null || !stats.isActiveAndEnabled) continue;
-                Guid id = GetId(stats.gameObject);
-                if (id == Guid.Empty || current.ContainsKey(id)) continue;
-                byte[] payload = BuildTargetPayload(id, stats);
-                current.Add(id, payload);
-                accepted++;
-            }
-            if (all.Length > MaxTargets) WarnHostOnce("targets", "Too many status-effect targets; only " + MaxTargets + " are synchronized.");
-
-            var changed = new List<KeyValuePair<Guid, byte[]>>();
-            foreach (var pair in current)
-            {
-                byte[] previous;
-                if (full || !_sent.TryGetValue(pair.Key, out previous) || !BytesEqual(previous, pair.Value))
-                    changed.Add(pair);
-            }
-            if (!full)
-            {
-                foreach (Guid missing in _sent.Keys)
-                    if (!current.ContainsKey(missing)) changed.Add(new KeyValuePair<Guid, byte[]>(missing, EmptyTargetPayload(missing)));
+                // A forced refresh (join, level change) is followed by a longer first gap so the
+                // periodic refreshes of the snapshot streams do not land in the same frame.
+                bool forced = _nextFullRefresh <= 0f;
+                _nextFullRefresh = now + FullRefreshInterval + (forced ? ForcedRefreshPhase : 0f);
+                _sortNames.Clear();
             }
 
-            SendSnapshots(changed, full);
-            for (int i = 0; i < changed.Count; i++)
+            _current.Clear();
+            _changed.Clear();
+            _valuesStream.SetLength(0);
+            ClearPassLookups();
+            bool completed = false;
+            try
             {
-                Guid id = changed[i].Key;
-                if (current.ContainsKey(id)) _sent[id] = changed[i].Value;
-                else _sent.Remove(id);
+                int count = CollectTargets(now, full);
+                CharacterStats[] all = _targets;
+                SortByName(all, count);
+                int manifests = 0;
+                int values = 0;
+                int unchanged = 0;
+                for (int i = 0; i < count && _current.Count < MaxTargets; i++)
+                {
+                    CharacterStats stats = all[i];
+                    if (stats == null || !stats.isActiveAndEnabled) continue;
+                    Guid id = GetId(stats.gameObject);
+                    if (id == Guid.Empty || !_current.Add(id)) continue;
+                    HostTarget target;
+                    _sent.TryGetValue(id, out target);
+                    switch (CaptureTarget(id, stats, target, full))
+                    {
+                        case Capture.Manifest: manifests++; break;
+                        case Capture.Values: values++; break;
+                        default: unchanged++; break;
+                    }
+                }
+                if (count > MaxTargets) WarnHostOnce("targets", "Too many status-effect targets; only " + MaxTargets + " are synchronized.");
+
+                // A full manifest drops absent targets on the guest by itself; a delta names them.
+                _missing.Clear();
+                foreach (Guid known in _sent.Keys)
+                    if (!_current.Contains(known)) _missing.Add(known);
+                for (int i = 0; i < _missing.Count; i++)
+                {
+                    _sent.Remove(_missing[i]);
+                    if (full) continue;
+                    _changed.Add(new Outgoing { Id = _missing[i], Body = EmptyTargetBody, Length = EmptyTargetBody.Length });
+                    manifests++;
+                }
+
+                SendSnapshots(_changed, full);
+                completed = true;
+
+                if (full) PerfStats.Count("status.full");
+                else if (_changed.Count > 0) PerfStats.Count("status.delta");
+                PerfStats.Count("status.records", manifests);
+                PerfStats.Count("status.values", values);
+                PerfStats.Count("status.skipped", unchanged);
+            }
+            finally
+            {
+                if (!completed)
+                {
+                    // What the guests hold is unknown after a failed sample; start again from a full manifest.
+                    _sent.Clear();
+                    _nextFullRefresh = 0f;
+                }
+                _current.Clear();
+                _changed.Clear();
+                _missing.Clear();
+                _captureEffects.Clear();
+                Array.Clear(_targets, 0, _targets.Length);
+                ClearPassLookups();
+                PerfStats.End("status.capture", started);
             }
         }
 
-        private byte[] BuildTargetPayload(Guid id, CharacterStats stats)
+        /// <summary>Orders targets by name as before, reading each native name once per full refresh instead of once per comparison.</summary>
+        private void SortByName(CharacterStats[] all, int count)
         {
+            if (_sortKeys.Length < count) _sortKeys = new string[Math.Max(count, _sortKeys.Length * 2)];
+            for (int i = 0; i < count; i++)
+            {
+                int key = all[i].GetInstanceID();
+                string name;
+                if (!_sortNames.TryGetValue(key, out name)) _sortNames.Add(key, name = all[i].name);
+                _sortKeys[i] = name;
+            }
+            Array.Sort(_sortKeys, all, 0, count, StringComparer.Ordinal);
+            Array.Clear(_sortKeys, 0, count);
+        }
+
+        // ---- host target set ----
+        //
+        // Searching the scene for every CharacterStats costs several milliseconds, and the sample runs
+        // four times a second. The enabled components are tracked from their own OnEnable and
+        // OnDisable instead; a search still seeds the set, repeats after every level change and
+        // every SetCheckInterval, and repairs the set if the two ever disagree.
+
+        internal static void TrackEnabled(CharacterStats stats)
+        {
+            if (s_enabledIds.Add(stats.GetInstanceID())) s_enabled.Add(stats);
+        }
+
+        internal static void TrackDisabled(CharacterStats stats)
+        {
+            if (!s_enabledIds.Remove(stats.GetInstanceID())) return;
+            for (int i = s_enabled.Count - 1; i >= 0; i--)
+            {
+                if (!ReferenceEquals(s_enabled[i], stats)) continue;
+                s_enabled[i] = s_enabled[s_enabled.Count - 1];
+                s_enabled.RemoveAt(s_enabled.Count - 1);
+                return;
+            }
+        }
+
+        /// <summary>Fills _targets with the enabled CharacterStats and returns how many there are.</summary>
+        private int CollectTargets(float now, bool full)
+        {
+            // Once the hooks have been caught missing a change, every full refresh searches again.
+            if (!s_enabledSeeded || now >= _nextSetCheck || s_enabledDrifted && full)
+            {
+                _nextSetCheck = now + SetCheckInterval;
+                CheckEnabledSet();
+            }
+            int count = 0;
+            for (int i = s_enabled.Count - 1; i >= 0; i--)
+            {
+                CharacterStats stats = s_enabled[i];
+                if (stats == null)
+                {
+                    // Destroyed without a disable call reaching the hook.
+                    s_enabledIds.Remove(stats.GetInstanceID());
+                    s_enabled[i] = s_enabled[s_enabled.Count - 1];
+                    s_enabled.RemoveAt(s_enabled.Count - 1);
+                    continue;
+                }
+                if (count == _targets.Length) Array.Resize(ref _targets, _targets.Length * 2);
+                _targets[count++] = stats;
+            }
+            return count;
+        }
+
+        private void CheckEnabledSet()
+        {
+            long started = PerfStats.Begin();
+            CharacterStats[] found = UnityEngine.Object.FindObjectsOfType<CharacterStats>();
+            int wrong = 0;
+            _scratchInstances.Clear();
+            for (int i = 0; i < found.Length; i++)
+            {
+                CharacterStats stats = found[i];
+                if (stats == null || !stats.isActiveAndEnabled) continue;
+                _scratchInstances.Add(stats.GetInstanceID());
+                if (!s_enabledIds.Add(stats.GetInstanceID())) continue;
+                s_enabled.Add(stats);
+                wrong++;
+            }
+            for (int i = s_enabled.Count - 1; i >= 0; i--)
+            {
+                CharacterStats stats = s_enabled[i];
+                if (stats != null && _scratchInstances.Contains(stats.GetInstanceID())) continue;
+                s_enabledIds.Remove(stats.GetInstanceID());
+                s_enabled[i] = s_enabled[s_enabled.Count - 1];
+                s_enabled.RemoveAt(s_enabled.Count - 1);
+                if (stats != null) wrong++;
+            }
+            _scratchInstances.Clear();
+            if (s_enabledSeeded && wrong > 0)
+            {
+                s_enabledDrifted = true;
+                PerfStats.Count("status.set_drift", wrong);
+                WarnHostOnce("target-set", "The tracked status-effect target set missed " + wrong + " change(s); searching the scene at every refresh from now on.");
+            }
+            s_enabledSeeded = true;
+            PerfStats.End("status.scan", started);
+        }
+
+        private enum Capture { Unchanged, Values, Manifest }
+
+        /// <summary>
+        /// Queues what the guests need for one target. Between full refreshes a target whose cheap
+        /// structural inputs are unchanged is not serialised at all: only its moved timer values are
+        /// queued. Otherwise the structure is serialised and compared with the manifest last sent;
+        /// a changed structure, and every target of a full refresh, is queued as a complete manifest.
+        /// </summary>
+        private Capture CaptureTarget(Guid id, CharacterStats stats, HostTarget target, bool full)
+        {
+            if (!full && target != null && ReferenceEquals(target.Stats, stats) && SameLiveEffects(target, stats)
+                && target.Signature == ComputeSignature(stats))
+            {
+                int queued = QueueValues(id, target);
+                if (queued >= 0) return queued > 0 ? Capture.Values : Capture.Unchanged;
+                // A timer left its bound; the full encoding below rejects that effect as it always did.
+            }
+
             IList<StatusEffect> effects = stats.ActiveStatusEffects;
-            var encoded = new List<byte[]>(Math.Min(effects.Count, MaxEffectsPerTarget));
-            for (int i = 0; i < effects.Count && encoded.Count < MaxEffectsPerTarget; i++)
+            MemoryStream stream = _captureStream;
+            BinaryWriter writer = _captureWriter;
+            stream.SetLength(0);
+            _effectEnds.Clear();
+            _captureEffects.Clear();
+            writer.Write((byte)MessageType.StatusEffects);
+            writer.Write(0);
+            writer.Write(0);
+            writer.Write(0);
+            for (int i = 0; i < effects.Count && _effectEnds.Count < MaxEffectsPerTarget; i++)
             {
                 StatusEffect effect = effects[i];
                 if (effect == null || effect.Params == null) continue;
-                byte[] data;
                 string error;
-                if (TryWriteEffect(effect, out data, out error)) encoded.Add(data);
-                else WarnHostOnce(id + ":" + effect.EffectID + ":" + error,
-                    "Unsupported status effect " + Describe(effect) + " on " + stats.name + ": " + error);
+                if (TryWriteEffect(writer, stream, effect, out error))
+                {
+                    _effectEnds.Add((int)stream.Length);
+                    _captureEffects.Add(effect);
+                }
+                else
+                {
+                    string key = id + ":" + effect.EffectID + ":" + error;
+                    if (_hostWarnings.Add(key))
+                        Plugin.Log?.LogWarning("Unsupported status effect " + Describe(effect) + " on " + stats.name + ": " + error);
+                }
             }
             if (effects.Count > MaxEffectsPerTarget)
                 WarnHostOnce(id + ":count", "Status effect list on " + stats.name + " exceeded " + MaxEffectsPerTarget + "; extra effects were omitted.");
 
-            while (true)
+            while (stream.Length + (long)_effectEnds.Count * TimerBytesPerEffect > MaxTargetBytes)
             {
-                using (var stream = new MemoryStream())
-                using (var writer = new BinaryWriter(stream, Encoding.UTF8))
-                {
-                    writer.Write(id.ToByteArray());
-                    writer.Write(encoded.Count);
-                    for (int i = 0; i < encoded.Count; i++) writer.Write(encoded[i]);
-                    writer.Flush();
-                    byte[] payload = stream.ToArray();
-                    if (payload.Length <= MaxTargetBytes) return payload;
-                    if (encoded.Count == 0) throw new InvalidOperationException("empty status target exceeded its size bound");
-                }
-                encoded.RemoveAt(encoded.Count - 1);
+                if (_effectEnds.Count == 0) throw new InvalidOperationException("empty status target exceeded its size bound");
+                _effectEnds.RemoveAt(_effectEnds.Count - 1);
+                _captureEffects.RemoveAt(_captureEffects.Count - 1);
+                stream.SetLength(_effectEnds.Count > 0 ? _effectEnds[_effectEnds.Count - 1] : TargetHeaderBytes);
                 WarnHostOnce(id + ":bytes", "Status effect list on " + stats.name + " exceeded the per-target byte bound; trailing effects were omitted.");
             }
-        }
 
-        private static byte[] EmptyTargetPayload(Guid id)
-        {
-            using (var stream = new MemoryStream(20))
-            using (var writer = new BinaryWriter(stream, Encoding.UTF8))
+            int count = _effectEnds.Count;
+            int structureEnd = (int)stream.Length;
+            stream.Position = 1;
+            writer.Write(count);
+            stream.Position = StructureLengthOffset;
+            writer.Write(structureEnd - TargetHeaderBytes);
+            writer.Flush();
+            stream.Position = structureEnd;
+
+            bool sameStructure = target != null && SameStructure(target.Body, stream.GetBuffer(), structureEnd);
+            if (target == null) _sent.Add(id, target = new HostTarget());
+            target.Stats = stats;
+            if (target.Effects.Length < count)
             {
-                writer.Write(id.ToByteArray());
-                writer.Write(0);
-                writer.Flush();
-                return stream.ToArray();
+                // The sent timer values are only read again while the structure, and so the count, is unchanged.
+                int capacity = Math.Max(count, target.Effects.Length * 2);
+                target.Effects = new StatusEffect[capacity];
+                target.TimeActive = new float[capacity];
+                target.IntervalTimer = new float[capacity];
+                target.IntervalCount = new uint[capacity];
             }
+            else if (target.Count > count) Array.Clear(target.Effects, count, target.Count - count);
+            for (int i = 0; i < count; i++) target.Effects[i] = _captureEffects[i];
+            target.Count = count;
+            StoreLiveEffects(target, stats);
+            target.Signature = ComputeSignature(stats);
+
+            if (sameStructure && !full)
+                return QueueValues(id, target) > 0 ? Capture.Values : Capture.Unchanged;
+
+            if (!sameStructure)
+            {
+                _structureRevision = unchecked(_structureRevision + 1);
+                if (_structureRevision == 0) _structureRevision = 1;
+                target.StructureRevision = _structureRevision;
+            }
+            stream.Position = StructureRevisionOffset;
+            writer.Write(target.StructureRevision);
+            writer.Flush();
+            stream.Position = structureEnd;
+            for (int i = 0; i < count; i++)
+            {
+                StatusEffect effect = target.Effects[i];
+                writer.Write(target.TimeActive[i] = effect.m_timeActive);
+                writer.Write(target.IntervalTimer[i] = effect.m_intervalTimer);
+                writer.Write(target.IntervalCount[i] = effect.m_intervalCount);
+            }
+            writer.Flush();
+
+            // A manifest identical to the one last sent (a refresh of a target without running timers) reuses its array.
+            int length = (int)stream.Length;
+            byte[] previous = target.Body;
+            bool identical = previous != null && previous.Length == length;
+            if (identical)
+            {
+                byte[] buffer = stream.GetBuffer();
+                int i = 0;
+                while (i < length && buffer[i] == previous[i]) i++;
+                identical = i == length;
+            }
+            if (!identical) target.Body = stream.ToArray();
+            _changed.Add(new Outgoing { Id = id, Body = target.Body, Length = target.Body.Length });
+            return Capture.Manifest;
         }
 
-        private bool TryWriteEffect(StatusEffect effect, out byte[] data, out string error)
+        /// <summary>
+        /// Queues a values-only body with every timer value of the target that differs from what was
+        /// last sent. Returns 1 when one was queued, 0 when nothing moved and -1, with nothing queued,
+        /// when a moved timer is not a bounded number.
+        /// </summary>
+        private int QueueValues(Guid id, HostTarget target)
         {
-            data = null;
+            StatusEffect[] effects = target.Effects;
+            int entries = 0;
+            for (int i = 0; i < target.Count; i++)
+            {
+                StatusEffect effect = effects[i];
+                float timeActive = effect.m_timeActive;
+                float intervalTimer = effect.m_intervalTimer;
+                if (timeActive == target.TimeActive[i] && intervalTimer == target.IntervalTimer[i]
+                    && effect.m_intervalCount == target.IntervalCount[i]) continue;
+                if (!IsBounded(timeActive) || !IsBounded(intervalTimer)) return -1;
+                entries++;
+            }
+            if (entries == 0) return 0;
+
+            MemoryStream stream = _valuesStream;
+            BinaryWriter writer = _valuesWriter;
+            int start = (int)stream.Length;
+            writer.Write(ValuesBodyTag);
+            writer.Write(target.StructureRevision);
+            writer.Write(entries);
+            for (int i = 0; i < target.Count; i++)
+            {
+                StatusEffect effect = effects[i];
+                float timeActive = effect.m_timeActive;
+                float intervalTimer = effect.m_intervalTimer;
+                uint intervalCount = effect.m_intervalCount;
+                int mask = 0;
+                if (timeActive != target.TimeActive[i]) mask |= 1;
+                if (intervalTimer != target.IntervalTimer[i]) mask |= 2;
+                if (intervalCount != target.IntervalCount[i]) mask |= 4;
+                if (mask == 0) continue;
+                writer.Write((byte)i);
+                writer.Write((byte)mask);
+                if ((mask & 1) != 0) writer.Write(target.TimeActive[i] = timeActive);
+                if ((mask & 2) != 0) writer.Write(target.IntervalTimer[i] = intervalTimer);
+                if ((mask & 4) != 0) writer.Write(target.IntervalCount[i] = intervalCount);
+            }
+            writer.Flush();
+            _changed.Add(new Outgoing { Id = id, Offset = start, Length = (int)stream.Length - start });
+            return 1;
+        }
+
+        /// <summary>True while the target's live list holds the same effect objects, in order, as when its structure was serialised.</summary>
+        private static bool SameLiveEffects(HostTarget target, CharacterStats stats)
+        {
+            List<StatusEffect> live = EffectList(stats);
+            if (live.Count != target.LiveCount) return false;
+            StatusEffect[] known = target.Live;
+            for (int i = 0; i < live.Count; i++)
+                if (!ReferenceEquals(live[i], known[i])) return false;
+            return true;
+        }
+
+        private static void StoreLiveEffects(HostTarget target, CharacterStats stats)
+        {
+            List<StatusEffect> live = EffectList(stats);
+            if (target.Live.Length < live.Count) target.Live = new StatusEffect[Math.Max(live.Count, target.Live.Length * 2)];
+            else if (target.LiveCount > live.Count) Array.Clear(target.Live, live.Count, target.LiveCount - live.Count);
+            live.CopyTo(target.Live);
+            target.LiveCount = live.Count;
+        }
+
+        /// <summary>
+        /// Hashes every input of an effect's structure that can be read without searching: the same
+        /// fields the manifest encodes, with objects by identity and without the three timers. What it
+        /// cannot see (an origin's name, ordinal or display string, a template index) changes only
+        /// together with one of these inputs or is picked up by the next full refresh.
+        /// </summary>
+        private static ulong ComputeSignature(CharacterStats stats)
+        {
+            List<StatusEffect> effects = EffectList(stats);
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < effects.Count; i++)
+            {
+                StatusEffect effect = effects[i];
+                StatusEffectParams p = effect != null ? effect.Params : null;
+                if (p == null)
+                {
+                    Mix(ref hash, 0);
+                    continue;
+                }
+                Mix(ref hash, RuntimeHelpers.GetHashCode(p));
+                Mix(ref hash, unchecked((int)effect.EffectID));
+                MixId(ref hash, GetId(effect.Owner));
+                MixId(ref hash, GetId(effect.Source));
+                MixId(ref hash, GetId(effect.ExtraObject));
+                MixObject(ref hash, effect.AfflictionOrigin);
+                MixObject(ref hash, effect.AbilityOrigin);
+                MixObject(ref hash, effect.PhraseOrigin);
+                Equippable equipment = effect.EquipmentOrigin;
+                MixObject(ref hash, equipment);
+                if (equipment != null) MixId(ref hash, GetId(equipment.gameObject));
+                Mix(ref hash, (int)effect.AbilityType);
+                Mix(ref hash, EffectFlags(effect));
+                Mix(ref hash, unchecked((int)effect.m_suspensionCount));
+                Mix(ref hash, BaseDuration(effect));
+                Mix(ref hash, effect.m_durationOverride);
+                Mix(ref hash, TemporaryDuration(effect));
+                Mix(ref hash, effect.UnadjustedDurationAdd);
+                Mix(ref hash, effect.Scale);
+                Mix(ref hash, effect.m_durationScale);
+                Mix(ref hash, effect.m_religiousScale);
+                Mix(ref hash, unchecked((int)effect.m_generalCounter));
+                Mix(ref hash, effect.m_triggerCount);
+                Mix(ref hash, effect.m_numRestCycles);
+                Mix(ref hash, effect.m_stackingKey);
+                Mix(ref hash, effect.BundleId);
+                Mix(ref hash, (int)effect.Slot);
+                Mix(ref hash, effect.m_damageToReapply);
+                Mix(ref hash, effect.m_damageToAbsorb);
+                Mix(ref hash, effect.IncreasePerTick);
+                Mix(ref hash, effect.DurationAfterBreak);
+                Mix(ref hash, effect.FriendlyRadius);
+                MixReference(ref hash, AfflictionKeyword(effect));
+                if (p.AffectsStat == StatusEffect.ModifiedStat.StealSpell) Mix(ref hash, effect.Spells != null ? effect.Spells.Count : -1);
+
+                Mix(ref hash, ParamFlags(p));
+                Mix(ref hash, (int)p.Apply);
+                Mix(ref hash, (int)p.AffectsStat);
+                Mix(ref hash, (int)p.DmgType);
+                Mix(ref hash, p.Value);
+                Mix(ref hash, p.ExtraValue);
+                Mix(ref hash, p.TacticalMultiplier);
+                Mix(ref hash, p.MergedValue);
+                Mix(ref hash, p.Duration);
+                Mix(ref hash, p.MaxRestCycles);
+                Mix(ref hash, (int)p.IntervalRate);
+                Mix(ref hash, (int)p.RaceType);
+                Mix(ref hash, (int)p.ClassType);
+                Mix(ref hash, (int)p.AttributeType);
+                Mix(ref hash, (int)p.DefenseType);
+                MixReference(ref hash, p.Tag);
+                MixReference(ref hash, p.Keyword);
+                MixReference(ref hash, p.Description);
+
+                StatusEffectTrigger trigger = p.TriggerAdjustment ?? DefaultTrigger;
+                Mix(ref hash, (int)trigger.Type);
+                Mix(ref hash, trigger.TriggerValue);
+                Mix(ref hash, trigger.ValueAdjustment);
+                Mix(ref hash, trigger.DurationAdjustment);
+                Mix(ref hash, trigger.RadiusAdjustment);
+                Mix(ref hash, trigger.MaxTriggerCount);
+                Mix(ref hash, (trigger.RemoveEffectAtMax ? 1 : 0) | (trigger.ResetTriggerOnEffectPulse ? 2 : 0) | (trigger.ResetTriggerOnEffectEnd ? 4 : 0));
+
+                StatusEffectLevelScaling scaling = p.LevelScaling ?? DefaultScaling;
+                Mix(ref hash, scaling.BaseLevel);
+                Mix(ref hash, scaling.LevelIncrement);
+                Mix(ref hash, scaling.MaxLevel);
+                Mix(ref hash, scaling.ValueAdjustment);
+                Mix(ref hash, scaling.ExtraValueAdjustment);
+                Mix(ref hash, scaling.DurationAdjustment);
+            }
+            return hash;
+        }
+
+        private static void Mix(ref ulong hash, int value)
+        {
+            hash = (hash ^ unchecked((uint)value)) * 1099511628211UL;
+        }
+
+        private static void Mix(ref ulong hash, float value)
+        {
+            hash = (hash ^ WireBits.FromFloat(value)) * 1099511628211UL;
+        }
+
+        private static void MixId(ref ulong hash, Guid value)
+        {
+            var bits = new GuidBits { Value = value };
+            hash = (hash ^ unchecked((ulong)bits.Low)) * 1099511628211UL;
+            hash = (hash ^ unchecked((ulong)bits.High)) * 1099511628211UL;
+        }
+
+        private static void MixObject(ref ulong hash, UnityEngine.Object value)
+        {
+            Mix(ref hash, value != null ? value.GetInstanceID() : 0);
+        }
+
+        private static void MixReference(ref ulong hash, object value)
+        {
+            Mix(ref hash, value != null ? RuntimeHelpers.GetHashCode(value) : 0);
+        }
+
+        /// <summary>True when a serialised structure (count, byte count and effect bytes) equals the one in a held manifest body.</summary>
+        private static bool SameStructure(byte[] held, byte[] candidate, int structureEnd)
+        {
+            if (held == null || structureEnd < TargetHeaderBytes || held.Length < structureEnd || candidate.Length < structureEnd) return false;
+            for (int i = 1; i < StructureRevisionOffset; i++) if (held[i] != candidate[i]) return false;
+            for (int i = StructureLengthOffset; i < structureEnd; i++) if (held[i] != candidate[i]) return false;
+            return true;
+        }
+
+        private static bool IsBounded(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value) && Math.Abs(value) <= MaxMagnitude;
+        }
+
+        /// <summary>Appends one effect to the target body; a rejected effect leaves the body as it was.</summary>
+        private static bool TryWriteEffect(BinaryWriter writer, MemoryStream stream, StatusEffect effect, out string error)
+        {
             error = null;
             if (effect.Params.AffectsStat == StatusEffect.ModifiedStat.StealSpell && effect.Spells != null && effect.Spells.Count > 0)
             {
                 error = "materialized stolen-spell lists have no presentation proxy";
                 return false;
             }
+            writer.Flush();
+            long start = stream.Length;
             try
             {
-                using (var stream = new MemoryStream(512))
-                using (var writer = new BinaryWriter(stream, Encoding.UTF8))
-                {
-                    WriteEffect(writer, effect);
-                    writer.Flush();
-                    data = stream.ToArray();
-                    return true;
-                }
+                WriteEffect(writer, effect);
+                writer.Flush();
+                return true;
             }
             catch (Exception ex) when (ex is InvalidDataException || ex is ArgumentException || ex is IndexOutOfRangeException || ex is NullReferenceException)
             {
+                writer.Flush();
+                stream.SetLength(start);
                 error = ex.Message;
                 return false;
             }
@@ -295,43 +891,32 @@ namespace PoECoop.Sync
                 out originObject, out templateKind, out templateOrdinal, out parameterIndex);
 
             writer.Write(unchecked((int)effect.EffectID));
-            writer.Write(GetId(effect.Owner).ToByteArray());
-            writer.Write(GetId(effect.Source).ToByteArray());
-            writer.Write(GetId(effect.ExtraObject).ToByteArray());
+            WriteGuid(writer, GetId(effect.Owner));
+            WriteGuid(writer, GetId(effect.Source));
+            WriteGuid(writer, GetId(effect.ExtraObject));
             writer.Write((byte)originKind);
             WriteString(writer, originName, 128);
             WriteString(writer, originTag, 128);
             writer.Write(displayId);
             writer.Write(originOrdinal);
-            writer.Write(originObject.ToByteArray());
+            WriteGuid(writer, originObject);
             writer.Write((byte)templateKind);
             writer.Write(templateOrdinal);
             writer.Write(parameterIndex);
             writer.Write((int)effect.AbilityType);
 
-            int flags = 0;
-            if (effect.Applied) flags |= 1;
-            if (effect.m_deleteOnClear) flags |= 2;
-            if (effect.m_effect_is_on_main_target) flags |= 4;
-            if (effect.RemovingEffect) flags |= 8;
-            if (effect.IsFromAura) flags |= 16;
-            if (effect.m_forceStackable) flags |= 32;
-            if (effect.m_needsDurationCalculated) flags |= 64;
-            if (TacticalClear(effect)) flags |= 128;
-            if (effect.TicksAfterBreak) flags |= 256;
-            if (effect.IsSuppressed) flags |= 512;
-            writer.Write(flags);
+            writer.Write(EffectFlags(effect));
             writer.Write(unchecked((int)effect.m_suspensionCount));
             WriteFloat(writer, BaseDuration(effect));
             WriteFloat(writer, effect.m_durationOverride);
-            WriteFloat(writer, effect.m_timeActive);
+            // The timers travel after the structure; an effect whose timers cannot be sent is still rejected here.
+            RequireBounded(effect.m_timeActive);
+            RequireBounded(effect.m_intervalTimer);
             WriteFloat(writer, TemporaryDuration(effect));
             WriteFloat(writer, effect.UnadjustedDurationAdd);
             WriteFloat(writer, effect.Scale);
             WriteFloat(writer, effect.m_durationScale);
             WriteFloat(writer, effect.m_religiousScale);
-            WriteFloat(writer, effect.m_intervalTimer);
-            writer.Write(unchecked((int)effect.m_intervalCount));
             writer.Write(unchecked((int)effect.m_generalCounter));
             writer.Write(effect.m_triggerCount);
             writer.Write(effect.m_numRestCycles);
@@ -345,21 +930,7 @@ namespace PoECoop.Sync
             WriteFloat(writer, effect.FriendlyRadius);
             WriteString(writer, AfflictionKeyword(effect), 128);
 
-            int paramFlags = 0;
-            if (p.Persistent) paramFlags |= 1;
-            if (p.IsHostile) paramFlags |= 2;
-            if (p.KeepOnDeath) paramFlags |= 4;
-            if (p.OneHitUse) paramFlags |= 8;
-            if (p.LastsUntilCombatEnds) paramFlags |= 16;
-            if (p.LastsUntilRest) paramFlags |= 32;
-            if (p.HideFromUi) paramFlags |= 64;
-            if (p.HideFromPortrait) paramFlags |= 128;
-            if (p.ChecksReligion) paramFlags |= 256;
-            if (p.DontHideFromLog) paramFlags |= 512;
-            if (p.IgnoreAbilityDeactivation) paramFlags |= 1024;
-            if (p.DoNotScalePlayer) paramFlags |= 2048;
-            if (p.IsCleanedUp) paramFlags |= 4096;
-            writer.Write(paramFlags);
+            writer.Write(ParamFlags(p));
             writer.Write((int)p.Apply);
             writer.Write((int)p.AffectsStat);
             writer.Write((int)p.DmgType);
@@ -379,7 +950,7 @@ namespace PoECoop.Sync
             WriteString(writer, p.Description, MaxStringLength);
             WriteString(writer, effect.BundleName, MaxStringLength);
 
-            StatusEffectTrigger trigger = p.TriggerAdjustment ?? new StatusEffectTrigger();
+            StatusEffectTrigger trigger = p.TriggerAdjustment ?? DefaultTrigger;
             writer.Write((int)trigger.Type);
             WriteFloat(writer, trigger.TriggerValue);
             WriteFloat(writer, trigger.ValueAdjustment);
@@ -390,13 +961,48 @@ namespace PoECoop.Sync
             writer.Write(trigger.ResetTriggerOnEffectPulse);
             writer.Write(trigger.ResetTriggerOnEffectEnd);
 
-            StatusEffectLevelScaling scaling = p.LevelScaling ?? new StatusEffectLevelScaling();
+            StatusEffectLevelScaling scaling = p.LevelScaling ?? DefaultScaling;
             writer.Write(scaling.BaseLevel);
             writer.Write(scaling.LevelIncrement);
             writer.Write(scaling.MaxLevel);
             WriteFloat(writer, scaling.ValueAdjustment);
             WriteFloat(writer, scaling.ExtraValueAdjustment);
             WriteFloat(writer, scaling.DurationAdjustment);
+        }
+
+        private static int EffectFlags(StatusEffect effect)
+        {
+            int flags = 0;
+            if (effect.Applied) flags |= 1;
+            if (effect.m_deleteOnClear) flags |= 2;
+            if (effect.m_effect_is_on_main_target) flags |= 4;
+            if (effect.RemovingEffect) flags |= 8;
+            if (effect.IsFromAura) flags |= 16;
+            if (effect.m_forceStackable) flags |= 32;
+            if (effect.m_needsDurationCalculated) flags |= 64;
+            if (TacticalClear(effect)) flags |= 128;
+            if (effect.TicksAfterBreak) flags |= 256;
+            if (effect.IsSuppressed) flags |= 512;
+            return flags;
+        }
+
+        private static int ParamFlags(StatusEffectParams p)
+        {
+            int flags = 0;
+            if (p.Persistent) flags |= 1;
+            if (p.IsHostile) flags |= 2;
+            if (p.KeepOnDeath) flags |= 4;
+            if (p.OneHitUse) flags |= 8;
+            if (p.LastsUntilCombatEnds) flags |= 16;
+            if (p.LastsUntilRest) flags |= 32;
+            if (p.HideFromUi) flags |= 64;
+            if (p.HideFromPortrait) flags |= 128;
+            if (p.ChecksReligion) flags |= 256;
+            if (p.DontHideFromLog) flags |= 512;
+            if (p.IgnoreAbilityDeactivation) flags |= 1024;
+            if (p.DoNotScalePlayer) flags |= 2048;
+            if (p.IsCleanedUp) flags |= 4096;
+            return flags;
         }
 
         private static void DescribeOrigin(StatusEffect effect, out OriginKind kind, out string name, out string tag,
@@ -415,7 +1021,7 @@ namespace PoECoop.Sync
             {
                 var affliction = (Affliction)origin;
                 kind = OriginKind.Affliction;
-                name = NormalizedName(affliction.gameObject);
+                name = NormalizedName(affliction);
                 tag = affliction.Tag;
                 displayId = affliction.DisplayName.StringID;
                 FindArray(affliction.StatusEffects, effect.Params, out parameterIndex);
@@ -425,7 +1031,7 @@ namespace PoECoop.Sync
             {
                 var phrase = (Phrase)origin;
                 kind = OriginKind.Phrase;
-                name = NormalizedName(phrase.gameObject);
+                name = NormalizedName(phrase);
                 tag = phrase.Tag;
                 displayId = phrase.DisplayName.StringID;
                 ordinal = FindPhraseOrdinal(effect.Owner, phrase);
@@ -445,7 +1051,7 @@ namespace PoECoop.Sync
             {
                 var equipment = (Equippable)origin;
                 kind = OriginKind.Equipment;
-                name = NormalizedName(equipment.gameObject);
+                name = NormalizedName(equipment);
                 displayId = equipment.DisplayName.StringID;
                 objectId = GetId(equipment.gameObject);
                 ordinal = FindComponentOrdinal(effect.Owner, equipment);
@@ -468,7 +1074,7 @@ namespace PoECoop.Sync
             {
                 var ability = (GenericAbility)origin;
                 kind = OriginKind.Ability;
-                name = NormalizedName(ability.gameObject);
+                name = NormalizedName(ability);
                 displayId = ability.DisplayName.StringID;
                 ordinal = FindComponentOrdinal(effect.Owner, ability);
                 FindArray(ability.StatusEffects, effect.Params, out parameterIndex);
@@ -493,59 +1099,66 @@ namespace PoECoop.Sync
             }
         }
 
-        private void SendSnapshots(List<KeyValuePair<Guid, byte[]>> snapshots, bool full)
+        private void SendSnapshots(List<Outgoing> snapshots, bool full)
         {
-            var chunks = new List<List<KeyValuePair<Guid, byte[]>>>();
-            var sizes = new List<int>();
-            List<KeyValuePair<Guid, byte[]>> chunk = null;
-            int size = 0;
-            for (int i = 0; i < snapshots.Count; i++)
-            {
-                int recordSize = snapshots[i].Value.Length;
-                if (chunk == null || chunk.Count >= MaxTargetsPerMessage || size + recordSize > MaxMessageBytes - 14)
-                {
-                    chunk = new List<KeyValuePair<Guid, byte[]>>();
-                    chunks.Add(chunk);
-                    sizes.Add(0);
-                    size = 14;
-                }
-                chunk.Add(snapshots[i]);
-                size += recordSize;
-                sizes[sizes.Count - 1] = size;
-            }
-            if (chunks.Count == 0)
+            byte[] valuesBuffer = _valuesStream.GetBuffer();
+            int chunkCount = 0;
+            for (int start = 0; start < snapshots.Count; start = ChunkEnd(snapshots, start)) chunkCount++;
+            if (chunkCount == 0)
             {
                 if (!full) return;
-                chunks.Add(new List<KeyValuePair<Guid, byte[]>>());
-                sizes.Add(14);
+                chunkCount = 1;
             }
 
-            for (int i = 0; i < chunks.Count; i++)
+            int next = 0;
+            for (int i = 0; i < chunkCount; i++)
             {
                 byte mode = FullDelta;
                 if (full)
                 {
-                    if (chunks.Count == 1) mode = FullSingle;
+                    if (chunkCount == 1) mode = FullSingle;
                     else if (i == 0) mode = FullBegin;
-                    else if (i == chunks.Count - 1) mode = FullEnd;
+                    else if (i == chunkCount - 1) mode = FullEnd;
                     else mode = FullContinuation;
                 }
-                using (var stream = new MemoryStream(sizes[i]))
-                using (var writer = new BinaryWriter(stream, Encoding.UTF8))
+                int end = next < snapshots.Count ? ChunkEnd(snapshots, next) : next;
+                MemoryStream stream = _messageStream;
+                BinaryWriter writer = _messageWriter;
+                stream.SetLength(0);
+                writer.Write((byte)MessageType.StatusEffects);
+                writer.Write(_epoch);
+                writer.Write(_revision);
+                writer.Write(mode);
+                writer.Write(end - next);
+                for (int j = next; j < end; j++)
                 {
-                    writer.Write((byte)MessageType.StatusEffects);
-                    writer.Write(_epoch);
-                    writer.Write(_revision);
-                    writer.Write(mode);
-                    writer.Write(chunks[i].Count);
-                    for (int j = 0; j < chunks[i].Count; j++) writer.Write(chunks[i][j].Value);
-                    writer.Flush();
-                    byte[] message = stream.ToArray();
-                    if (message.Length > TcpTransport.MaxMessageSize) throw new InvalidOperationException("status effect message exceeds transport bound");
-                    _session.SendToGuests(message);
+                    Outgoing body = snapshots[j];
+                    WriteGuid(writer, body.Id);
+                    writer.Write(body.Length);
+                    writer.Write(body.Body ?? valuesBuffer, body.Offset, body.Length);
                 }
+                writer.Flush();
+                byte[] message = stream.ToArray();
+                if (message.Length > TcpTransport.MaxMessageSize) throw new InvalidOperationException("status effect message exceeds transport bound");
+                _session.SendToGuests(message);
                 _revision = unchecked(_revision + 1);
+                next = end;
             }
+        }
+
+        /// <summary>Returns the exclusive end of the message chunk that starts at <paramref name="start"/>.</summary>
+        private static int ChunkEnd(List<Outgoing> snapshots, int start)
+        {
+            int size = 14;
+            int end = start;
+            while (end < snapshots.Count)
+            {
+                int recordSize = 20 + snapshots[end].Length;
+                if (end > start && (end - start >= MaxTargetsPerMessage || size + recordSize > MaxMessageBytes - 14)) break;
+                size += recordSize;
+                end++;
+            }
+            return end;
         }
 
         // ---- guest parsing and reconciliation ----
@@ -579,6 +1192,19 @@ namespace PoECoop.Sync
         private void OnGameMessage(PlayerInfo sender, MessageReader reader)
         {
             if (sender != null || reader.Type != MessageType.StatusEffects || !_session.IsGuest) return;
+            long started = PerfStats.Begin();
+            try
+            {
+                HandleSnapshot(reader);
+            }
+            finally
+            {
+                PerfStats.End("status.apply", started);
+            }
+        }
+
+        private void HandleSnapshot(MessageReader reader)
+        {
             int epoch = reader.Int();
             int revision = reader.Int();
             byte full = reader.Byte();
@@ -586,23 +1212,36 @@ namespace PoECoop.Sync
             int targetCount = reader.Int();
             if (targetCount < 0 || targetCount > MaxTargetsPerMessage) throw new FormatException("status target count " + targetCount);
 
-            var parsed = new Dictionary<Guid, GuestTarget>(targetCount);
+            var parsed = new Dictionary<Guid, Incoming>(targetCount);
             for (int i = 0; i < targetCount; i++)
             {
-                Guid targetId = reader.Guid();
+                Guid targetId = ReadGuid(reader);
                 if (targetId == Guid.Empty || parsed.ContainsKey(targetId)) throw new FormatException("duplicate or empty status target");
-                int effectCount = reader.Int();
-                if (effectCount < 0 || effectCount > MaxEffectsPerTarget) throw new FormatException("status effect count " + effectCount);
-                var target = new GuestTarget();
-                var ids = new HashSet<uint>();
-                for (int j = 0; j < effectCount; j++)
+                byte[] raw = reader.Bytes();
+                var incoming = new Incoming { Raw = raw };
+                GuestTarget existing;
+                _guestTargets.TryGetValue(targetId, out existing);
+                if (raw.Length > 0 && raw[0] == ValuesBodyTag)
                 {
-                    EffectRecord record = ReadEffect(reader);
-                    if (!ids.Add(record.Id)) throw new FormatException("duplicate host EffectID " + record.Id);
-                    target.Records.Add(record);
+                    if (full != FullDelta) throw new FormatException("status values outside a delta");
+                    if (raw.Length < ValuesHeaderBytes || raw.Length > ValuesHeaderBytes + MaxEffectsPerTarget * MaxValuesEntryBytes)
+                        throw new FormatException("status values size " + raw.Length);
+                    incoming.Values = true;
+                    ReadValues(raw, existing, false);
                 }
-                parsed.Add(targetId, target);
+                else
+                {
+                    if (raw.Length < TargetHeaderBytes || raw.Length > MaxTargetBytes) throw new FormatException("status target size " + raw.Length);
+                    // A manifest that is byte-identical to the one this target already holds was
+                    // validated when it first arrived; it is neither parsed nor allocated again.
+                    // One with the same structure has only its timer values read.
+                    if (existing != null && existing.Raw != null && BytesEqual(existing.Raw, raw)) incoming.Raw = existing.Raw;
+                    else if (existing != null && HoldsStructure(existing, raw)) ReadTimers(raw, existing, false);
+                    else incoming.Records = ParseTarget(raw);
+                }
+                parsed.Add(targetId, incoming);
             }
+            reader.Finish();
 
             bool startsFull = full == FullSingle || full == FullBegin;
             if (_guestEpoch == int.MinValue || epoch != _guestEpoch)
@@ -654,20 +1293,163 @@ namespace PoECoop.Sync
             _nextGuestRetry = 0f;
         }
 
+        /// <summary>
+        /// Parses and validates one manifest body: tag, effect count, structure revision, structure
+        /// byte count, the effects' structure, then one timer triple per effect, nothing after.
+        /// </summary>
+        private List<EffectRecord> ParseTarget(byte[] raw)
+        {
+            var reader = new MessageReader(raw);
+            if (reader.Type != MessageType.StatusEffects) throw new FormatException("status target tag " + (int)reader.Type);
+            int effectCount = reader.Int();
+            if (effectCount < 0 || effectCount > MaxEffectsPerTarget) throw new FormatException("status effect count " + effectCount);
+            reader.Int();
+            int structureLength = reader.Int();
+            int timerBytes = effectCount * TimerBytesPerEffect;
+            if (structureLength < 0 || structureLength != raw.Length - TargetHeaderBytes - timerBytes)
+                throw new FormatException("status structure length " + structureLength);
+            var records = new List<EffectRecord>(effectCount);
+            _scratchIds.Clear();
+            for (int j = 0; j < effectCount; j++)
+            {
+                EffectRecord record = ReadEffect(reader);
+                if (!_scratchIds.Add(record.Id)) throw new FormatException("duplicate host EffectID " + record.Id);
+                records.Add(record);
+            }
+            if (reader.Remaining != timerBytes) throw new FormatException("status structure does not end at its length");
+            for (int j = 0; j < effectCount; j++)
+            {
+                EffectRecord record = records[j];
+                record.TimeActive = ReadFloat(reader);
+                record.IntervalTimer = ReadFloat(reader);
+                record.IntervalCount = unchecked((uint)reader.Int());
+                if (record.IntervalCount > MaxCounter) throw new FormatException("status interval count outside its bound");
+            }
+            reader.Finish();
+            return records;
+        }
+
+        /// <summary>True when a received manifest body has exactly the structure of the manifest the target holds.</summary>
+        private static bool HoldsStructure(GuestTarget target, byte[] raw)
+        {
+            byte[] held = target.Raw;
+            return held != null && raw.Length == held.Length && raw[0] == held[0]
+                && SameStructure(held, raw, held.Length - target.Records.Count * TimerBytesPerEffect);
+        }
+
+        /// <summary>
+        /// Reads the timer triples of a manifest body whose structure the target already holds,
+        /// validating them and, when <paramref name="apply"/> is set, writing them to the records and
+        /// to the effects that are already mirrored.
+        /// </summary>
+        private static void ReadTimers(byte[] raw, GuestTarget target, bool apply)
+        {
+            List<EffectRecord> records = target.Records;
+            int at = raw.Length - records.Count * TimerBytesPerEffect;
+            for (int i = 0; i < records.Count; i++, at += TimerBytesPerEffect)
+            {
+                float timeActive = WireBits.ToFloat(unchecked((uint)WireInt(raw, at)));
+                float intervalTimer = WireBits.ToFloat(unchecked((uint)WireInt(raw, at + 4)));
+                uint intervalCount = unchecked((uint)WireInt(raw, at + 8));
+                if (!IsBounded(timeActive) || !IsBounded(intervalTimer) || intervalCount > MaxCounter)
+                    throw new FormatException("status timer outside its bound");
+                if (!apply) continue;
+                EffectRecord record = records[i];
+                record.TimeActive = timeActive;
+                record.IntervalTimer = intervalTimer;
+                record.IntervalCount = intervalCount;
+                MirrorEffect mirror;
+                if (!target.Effects.TryGetValue(record.Id, out mirror) || mirror.Effect == null) continue;
+                mirror.Effect.m_timeActive = timeActive;
+                mirror.Effect.m_intervalTimer = intervalTimer;
+                mirror.Effect.m_intervalCount = intervalCount;
+            }
+        }
+
+        /// <summary>
+        /// Reads a values-only body: tag, structure revision, entry count, then per entry the effect's
+        /// index in the manifest, a mask and the masked timer values. Always validates the whole body.
+        /// With <paramref name="apply"/> set, and only when the revision is the one of the manifest the
+        /// target holds, writes the values to the records, the held manifest and the mirrored effects;
+        /// identities, origins and the live list are not touched. Returns whether the revision matched.
+        /// </summary>
+        private static bool ReadValues(byte[] raw, GuestTarget target, bool apply)
+        {
+            var reader = new MessageReader(raw);
+            int revision = reader.Int();
+            int entries = reader.Int();
+            if (entries < 1 || entries > MaxEffectsPerTarget) throw new FormatException("status values count " + entries);
+            byte[] held = target != null ? target.Raw : null;
+            bool matches = held != null && WireInt(held, StructureRevisionOffset) == revision;
+            int limit = matches ? target.Records.Count : MaxEffectsPerTarget;
+            int timers = matches ? held.Length - limit * TimerBytesPerEffect : 0;
+            int previous = -1;
+            for (int i = 0; i < entries; i++)
+            {
+                int index = reader.Byte();
+                int mask = reader.Byte();
+                if (index <= previous || index >= limit || mask < 1 || mask > 7) throw new FormatException("status values entry " + index + "/" + mask);
+                previous = index;
+                float timeActive = (mask & 1) != 0 ? ReadFloat(reader) : 0f;
+                float intervalTimer = (mask & 2) != 0 ? ReadFloat(reader) : 0f;
+                uint intervalCount = (mask & 4) != 0 ? unchecked((uint)reader.Int()) : 0u;
+                if (intervalCount > MaxCounter) throw new FormatException("status interval count outside its bound");
+                if (!apply || !matches) continue;
+
+                EffectRecord record = target.Records[index];
+                MirrorEffect mirror;
+                StatusEffect effect = target.Effects.TryGetValue(record.Id, out mirror) ? mirror.Effect : null;
+                int at = timers + index * TimerBytesPerEffect;
+                if ((mask & 1) != 0)
+                {
+                    record.TimeActive = timeActive;
+                    PutWireInt(held, at, unchecked((int)WireBits.FromFloat(timeActive)));
+                    if (effect != null) effect.m_timeActive = timeActive;
+                }
+                if ((mask & 2) != 0)
+                {
+                    record.IntervalTimer = intervalTimer;
+                    PutWireInt(held, at + 4, unchecked((int)WireBits.FromFloat(intervalTimer)));
+                    if (effect != null) effect.m_intervalTimer = intervalTimer;
+                }
+                if ((mask & 4) != 0)
+                {
+                    record.IntervalCount = intervalCount;
+                    PutWireInt(held, at + 8, unchecked((int)intervalCount));
+                    if (effect != null) effect.m_intervalCount = intervalCount;
+                }
+            }
+            reader.Finish();
+            return matches;
+        }
+
+        private static int WireInt(byte[] data, int at)
+        {
+            return data[at] | data[at + 1] << 8 | data[at + 2] << 16 | data[at + 3] << 24;
+        }
+
+        private static void PutWireInt(byte[] data, int at, int value)
+        {
+            data[at] = (byte)value;
+            data[at + 1] = (byte)(value >> 8);
+            data[at + 2] = (byte)(value >> 16);
+            data[at + 3] = (byte)(value >> 24);
+        }
+
         private static EffectRecord ReadEffect(MessageReader reader)
         {
             var r = new EffectRecord
             {
                 Id = unchecked((uint)reader.Int()),
-                Owner = reader.Guid(),
-                Source = reader.Guid(),
-                ExtraObject = reader.Guid(),
+                Owner = ReadGuid(reader),
+                Source = ReadGuid(reader),
+                ExtraObject = ReadGuid(reader),
                 OriginKind = (OriginKind)reader.Byte(),
                 OriginName = ReadString(reader, 128),
                 OriginTag = ReadString(reader, 128),
                 DisplayId = reader.Int(),
                 OriginOrdinal = reader.Int(),
-                OriginObject = reader.Guid(),
+                OriginObject = ReadGuid(reader),
                 TemplateKind = (TemplateKind)reader.Byte(),
                 TemplateOrdinal = reader.Int(),
                 ParameterIndex = reader.Int(),
@@ -676,14 +1458,11 @@ namespace PoECoop.Sync
                 SuspensionCount = reader.Int(),
                 Duration = ReadFloat(reader),
                 DurationOverride = ReadFloat(reader),
-                TimeActive = ReadFloat(reader),
                 TemporaryDuration = ReadFloat(reader),
                 UnadjustedDurationAdd = ReadFloat(reader),
                 Scale = ReadFloat(reader),
                 DurationScale = ReadFloat(reader),
                 ReligiousScale = ReadFloat(reader),
-                IntervalTimer = ReadFloat(reader),
-                IntervalCount = unchecked((uint)reader.Int()),
                 GeneralCounter = unchecked((uint)reader.Int()),
                 TriggerCount = reader.Int(),
                 RestCycles = reader.Int(),
@@ -745,39 +1524,77 @@ namespace PoECoop.Sync
                 throw new FormatException("ability instances must not use GUIDs");
             if (r.OriginOrdinal < 0 || r.OriginOrdinal > 4096 || r.TemplateOrdinal < 0 || r.TemplateOrdinal > 4096
                 || r.ParameterIndex < -1 || r.ParameterIndex > 4096 || r.SuspensionCount < 0 || r.SuspensionCount > 4096
-                || r.IntervalCount > MaxCounter || r.GeneralCounter > MaxCounter || r.TriggerCount < 0 || r.TriggerCount > MaxCounter
+                || r.GeneralCounter > MaxCounter || r.TriggerCount < 0 || r.TriggerCount > MaxCounter
                 || r.RestCycles < 0 || r.RestCycles > MaxCounter || r.MaxRestCycles < 0 || r.MaxRestCycles > MaxCounter
                 || r.MaxTriggerCount < 0 || r.MaxTriggerCount > MaxCounter || r.ScalingBase < 0 || r.ScalingBase > MaxCounter
                 || r.ScalingIncrement < 0 || r.ScalingIncrement > MaxCounter || r.ScalingMax < 0)
                 throw new FormatException("status ordinal or counter outside its bound");
-            if (!Enum.IsDefined(typeof(GenericAbility.AbilityType), r.AbilityType)
-                || !Enum.IsDefined(typeof(StatusEffect.ApplyType), r.Apply)
-                || !Enum.IsDefined(typeof(StatusEffect.ModifiedStat), r.Stat)
-                || !Enum.IsDefined(typeof(DamagePacket.DamageType), r.DamageType)
-                || !Enum.IsDefined(typeof(StatusEffectParams.IntervalRateType), r.IntervalRate)
-                || !Enum.IsDefined(typeof(CharacterStats.Race), r.Race)
-                || !Enum.IsDefined(typeof(CharacterStats.Class), r.Class)
-                || !Enum.IsDefined(typeof(CharacterStats.AttributeScoreType), r.Attribute)
-                || !Enum.IsDefined(typeof(CharacterStats.DefenseType), r.Defense)
-                || !Enum.IsDefined(typeof(Equippable.EquipmentSlot), r.Slot)
-                || !Enum.IsDefined(typeof(StatusEffectTrigger.TriggerType), r.TriggerType))
+            if (!AbilityTypes.Contains(r.AbilityType)
+                || !ApplyTypes.Contains(r.Apply)
+                || !ModifiedStats.Contains(r.Stat)
+                || !DamageTypes.Contains(r.DamageType)
+                || !IntervalRates.Contains(r.IntervalRate)
+                || !Races.Contains(r.Race)
+                || !Classes.Contains(r.Class)
+                || !AttributeTypes.Contains(r.Attribute)
+                || !DefenseTypes.Contains(r.Defense)
+                || !EquipmentSlots.Contains(r.Slot)
+                || !TriggerTypes.Contains(r.TriggerType))
                 throw new FormatException("invalid status enumeration");
             if ((r.TemplateKind == TemplateKind.Inline) != (r.ParameterIndex < 0))
                 throw new FormatException("inconsistent status parameter template");
         }
 
-        private void MergeTarget(Guid id, GuestTarget incoming)
+        private void MergeTarget(Guid id, Incoming incoming)
         {
             GuestTarget existing;
-            if (_guestTargets.TryGetValue(id, out existing))
+            _guestTargets.TryGetValue(id, out existing);
+            if (incoming.Values)
             {
-                existing.Records = incoming.Records;
-                existing.Dirty = true;
+                // Values for an unknown target or another structure are dropped; the next manifest
+                // for the target (a structural change or the periodic refresh) carries every value.
+                if (existing != null && ReadValues(incoming.Raw, existing, true)) PerfStats.Count("status.values");
+                else PerfStats.Count("status.stale");
+                return;
             }
-            else _guestTargets.Add(id, incoming);
+            if (existing != null)
+            {
+                if (incoming.Records == null && existing.Raw != null)
+                {
+                    bool identical = BytesEqual(existing.Raw, incoming.Raw);
+                    if (identical || HoldsStructure(existing, incoming.Raw))
+                    {
+                        // Same structure again (a periodic full refresh): only the timer values can
+                        // differ, and they are written in place. A pending target retries now, as it
+                        // always did; an applied one only has its live list checked.
+                        if (!identical)
+                        {
+                            ReadTimers(incoming.Raw, existing, true);
+                            existing.Raw = incoming.Raw;
+                        }
+                        if (existing.Dirty) existing.NextRetry = 0f;
+                        else existing.Verify = true;
+                        return;
+                    }
+                }
+                existing.Records = incoming.Records ?? ParseTarget(incoming.Raw);
+                existing.Raw = incoming.Raw;
+                existing.Dirty = true;
+                existing.Verify = false;
+                existing.Failures = 0;
+                existing.NextRetry = 0f;
+            }
+            else
+            {
+                _guestTargets.Add(id, new GuestTarget
+                {
+                    Records = incoming.Records ?? ParseTarget(incoming.Raw),
+                    Raw = incoming.Raw,
+                });
+            }
         }
 
-        private void MergeFullManifest(Dictionary<Guid, GuestTarget> manifest)
+        private void MergeFullManifest(Dictionary<Guid, Incoming> manifest)
         {
             var missing = new List<Guid>();
             foreach (var pair in _guestTargets)
@@ -790,13 +1607,46 @@ namespace PoECoop.Sync
             foreach (var pair in manifest) MergeTarget(pair.Key, pair.Value);
         }
 
-        private void ReconcileTarget(Guid id, GuestTarget target)
+        /// <summary>
+        /// Cheap check for an applied target whose manifest arrived unchanged: the same object still
+        /// resolves, its live list is exactly the mirrored effects in host order, and every owner,
+        /// source, extra object and origin the manifest names is still alive. Anything else falls
+        /// back to the full reconciliation.
+        /// </summary>
+        private bool StillApplied(Guid id, GuestTarget target)
+        {
+            if (!target.Initialized || target.AppliedStats == null || target.AppliedObject == null) return false;
+            if (Resolve(id) != target.AppliedObject) return false;
+            List<StatusEffect> list = EffectList(target.AppliedStats);
+            List<EffectRecord> records = target.Records;
+            if (list.Count != records.Count || target.Effects.Count != records.Count) return false;
+            for (int i = 0; i < records.Count; i++)
+            {
+                EffectRecord record = records[i];
+                MirrorEffect mirror;
+                if (!target.Effects.TryGetValue(record.Id, out mirror) || mirror.Effect == null) return false;
+                StatusEffect effect = mirror.Effect;
+                if (!ReferenceEquals(list[i], effect) || effect.EffectID != record.Id) return false;
+                if (record.Owner != Guid.Empty && EffectOwner(effect) == null) return false;
+                if (record.Source != Guid.Empty && effect.Source == null) return false;
+                if (record.ExtraObject != Guid.Empty && effect.ExtraObject == null) return false;
+                if (record.OriginKind != OriginKind.None && effect.Origin == null) return false;
+            }
+            UpdateTracker(target.AppliedStats) = true;
+            return true;
+        }
+
+        /// <summary>Returns true when the target stays dirty because one of its effects could not be presented.</summary>
+        private bool ReconcileTarget(Guid id, GuestTarget target)
         {
             target.Dirty = false;
+            target.Verify = false;
+            target.AppliedObject = null;
+            target.AppliedStats = null;
             GameObject targetObject = Resolve(id);
-            if (targetObject == null) { target.Dirty = true; return; }
+            if (targetObject == null) { target.Dirty = true; return false; }
             CharacterStats stats = targetObject.GetComponent<CharacterStats>();
-            if (stats == null) { target.Dirty = true; return; }
+            if (stats == null) { target.Dirty = true; return false; }
 
             using (new ApplyScope())
             {
@@ -816,9 +1666,11 @@ namespace PoECoop.Sync
                     target.Initialized = true;
                 }
 
-                var present = new HashSet<uint>();
+                HashSet<uint> present = _scratchIds;
+                present.Clear();
                 for (int i = 0; i < target.Records.Count; i++) present.Add(target.Records[i].Id);
-                var absent = new List<uint>();
+                List<uint> absent = _scratchAbsent;
+                absent.Clear();
                 foreach (uint idKey in target.Effects.Keys) if (!present.Contains(idKey)) absent.Add(idKey);
                 for (int i = 0; i < absent.Count; i++)
                 {
@@ -869,6 +1721,7 @@ namespace PoECoop.Sync
                     mirror.WarningLogged = false;
                     UpdateEffectValues(mirror.Effect, record);
 
+                    if (i < list.Count && ReferenceEquals(list[i], mirror.Effect)) continue;
                     int desiredIndex = Math.Min(i, list.Count);
                     int currentIndex = list.IndexOf(mirror.Effect);
                     if (currentIndex != desiredIndex)
@@ -882,6 +1735,9 @@ namespace PoECoop.Sync
                 }
                 UpdateTracker(stats) = true;
             }
+            target.AppliedObject = targetObject;
+            target.AppliedStats = stats;
+            return target.Dirty;
         }
 
         private bool TryCreateEffect(EffectRecord record, GameObject target, CharacterStats stats, out StatusEffect effect, out string error)
@@ -933,12 +1789,15 @@ namespace PoECoop.Sync
 
         private bool ResolveOrigins(EffectRecord record, out OriginReferences origins, out string error)
         {
-            origins = new OriginReferences
-            {
-                Owner = Resolve(record.Owner),
-                Source = Resolve(record.Source),
-                ExtraObject = Resolve(record.ExtraObject),
-            };
+            // Consumed by the caller before the next effect is resolved, so one instance serves all.
+            origins = _origins;
+            origins.Owner = Resolve(record.Owner);
+            origins.Source = Resolve(record.Source);
+            origins.ExtraObject = Resolve(record.ExtraObject);
+            origins.Affliction = null;
+            origins.Ability = null;
+            origins.Equipment = null;
+            origins.Phrase = null;
             if (record.Owner != Guid.Empty && origins.Owner == null) { error = "owner entity is unresolved"; return false; }
 
             switch (record.OriginKind)
@@ -1100,8 +1959,10 @@ namespace PoECoop.Sync
             p.DontHideFromLog = (r.ParamFlags & 512) != 0;
             p.IgnoreAbilityDeactivation = (r.ParamFlags & 1024) != 0;
             p.DoNotScalePlayer = (r.ParamFlags & 2048) != 0;
-            CleanedUpProperty.SetValue(p, (r.ParamFlags & 4096) != 0, null);
-            MergedValueProperty.SetValue(p, r.MergedValue, null);
+            if (SetCleanedUp != null) SetCleanedUp(p, (r.ParamFlags & 4096) != 0);
+            else CleanedUpProperty.SetValue(p, (r.ParamFlags & 4096) != 0, null);
+            if (SetMergedValue != null) SetMergedValue(p, r.MergedValue);
+            else MergedValueProperty.SetValue(p, r.MergedValue, null);
             p.Apply = (StatusEffect.ApplyType)r.Apply;
             p.AffectsStat = (StatusEffect.ModifiedStat)r.Stat;
             p.DmgType = (DamagePacket.DamageType)r.DamageType;
@@ -1199,30 +2060,47 @@ namespace PoECoop.Sync
             if (registered != null)
             {
                 Affliction byId = registered.GetComponent<Affliction>();
-                if (byId != null && OriginMatches(record, byId.gameObject, record.DisplayId)) return byId;
+                if (byId != null && OriginMatches(record, byId, record.DisplayId)) return byId;
             }
             if (AfflictionData.Instance == null) return null;
             Affliction best = null;
             int matches = 0;
-            FieldInfo[] fields = typeof(AfflictionData).GetFields(BindingFlags.Instance | BindingFlags.Public);
+            List<Affliction> candidates = AfflictionCandidates();
+            for (int i = 0; i < candidates.Count; i++) ConsiderAffliction(candidates[i], record, ref best, ref matches);
+            return best;
+        }
+
+        /// <summary>The affliction prefabs of AfflictionData in their original search order, gathered once per pass.</summary>
+        private static List<Affliction> AfflictionCandidates()
+        {
+            if (s_passAfflictionsBuilt) return s_passAfflictions;
+            s_passAfflictionsBuilt = true;
+            s_passAfflictions.Clear();
+            AfflictionData data = AfflictionData.Instance;
+            if (s_afflictionFields == null) s_afflictionFields = typeof(AfflictionData).GetFields(BindingFlags.Instance | BindingFlags.Public);
+            FieldInfo[] fields = s_afflictionFields;
             for (int i = 0; i < fields.Length; i++)
             {
-                if (fields[i].FieldType == typeof(Affliction)) ConsiderAffliction(fields[i].GetValue(AfflictionData.Instance) as Affliction, record, ref best, ref matches);
+                if (fields[i].FieldType == typeof(Affliction))
+                {
+                    var single = fields[i].GetValue(data) as Affliction;
+                    if (single != null) s_passAfflictions.Add(single);
+                }
                 else if (fields[i].FieldType == typeof(Affliction[]))
                 {
-                    var array = fields[i].GetValue(AfflictionData.Instance) as Affliction[];
-                    if (array != null) for (int j = 0; j < array.Length; j++) ConsiderAffliction(array[j], record, ref best, ref matches);
+                    var array = fields[i].GetValue(data) as Affliction[];
+                    if (array != null) for (int j = 0; j < array.Length; j++) if (array[j] != null) s_passAfflictions.Add(array[j]);
                 }
             }
-            if (AfflictionData.Instance.AfflictionsForScripts != null)
-                for (int i = 0; i < AfflictionData.Instance.AfflictionsForScripts.Count; i++)
-                    ConsiderAffliction(AfflictionData.Instance.AfflictionsForScripts[i], record, ref best, ref matches);
-            return best;
+            if (data.AfflictionsForScripts != null)
+                for (int i = 0; i < data.AfflictionsForScripts.Count; i++)
+                    if (data.AfflictionsForScripts[i] != null) s_passAfflictions.Add(data.AfflictionsForScripts[i]);
+            return s_passAfflictions;
         }
 
         private static void ConsiderAffliction(Affliction candidate, EffectRecord record, ref Affliction best, ref int matches)
         {
-            if (candidate == null || !OriginMatches(record, candidate.gameObject, candidate.DisplayName.StringID)) return;
+            if (candidate == null || !OriginMatches(record, candidate, candidate.DisplayName.StringID)) return;
             if (!string.Equals(record.OriginTag, candidate.Tag ?? "", StringComparison.Ordinal)) return;
             best = candidate;
             matches++;
@@ -1236,7 +2114,7 @@ namespace PoECoop.Sync
         private static T FindComponent<T>(GameObject owner, EffectRecord record) where T : Component
         {
             if (owner == null) return null;
-            T[] components = owner.GetComponentsInChildren<T>(true);
+            T[] components = ChildrenOf<T>(owner);
             int occurrence = 0;
             for (int i = 0; i < components.Length; i++)
             {
@@ -1244,7 +2122,7 @@ namespace PoECoop.Sync
                 int displayId = -1;
                 if (component is GenericAbility) displayId = ((GenericAbility)(object)component).DisplayName.StringID;
                 else if (component is Equippable) displayId = ((Equippable)(object)component).DisplayName.StringID;
-                if (!OriginMatches(record, component.gameObject, displayId)) continue;
+                if (!OriginMatches(record, component, displayId)) continue;
                 if (occurrence++ == record.OriginOrdinal) return component;
             }
             return null;
@@ -1253,21 +2131,21 @@ namespace PoECoop.Sync
         private static Phrase FindPhrase(GameObject owner, EffectRecord record)
         {
             if (owner == null) return null;
-            Phrase[] phrases = owner.GetComponentsInChildren<Phrase>(true);
+            Phrase[] phrases = ChildrenOf<Phrase>(owner);
             int occurrence = 0;
             for (int i = 0; i < phrases.Length; i++)
             {
-                if (!OriginMatches(record, phrases[i].gameObject, phrases[i].DisplayName.StringID)) continue;
+                if (!OriginMatches(record, phrases[i], phrases[i].DisplayName.StringID)) continue;
                 if (!string.Equals(record.OriginTag, phrases[i].Tag ?? "", StringComparison.Ordinal)) continue;
                 if (occurrence++ == record.OriginOrdinal) return phrases[i];
             }
             ChanterTrait chanter = owner.GetComponent<ChanterTrait>();
             if (chanter != null)
             {
-                phrases = chanter.GetKnownPhrases();
+                phrases = KnownPhrasesOf(owner, chanter);
                 for (int i = 0; i < phrases.Length; i++)
                 {
-                    if (phrases[i] == null || !OriginMatches(record, phrases[i].gameObject, phrases[i].DisplayName.StringID)) continue;
+                    if (phrases[i] == null || !OriginMatches(record, phrases[i], phrases[i].DisplayName.StringID)) continue;
                     if (!string.Equals(record.OriginTag, phrases[i].Tag ?? "", StringComparison.Ordinal)) continue;
                     if (occurrence++ == record.OriginOrdinal) return phrases[i];
                 }
@@ -1275,7 +2153,7 @@ namespace PoECoop.Sync
             return null;
         }
 
-        private static bool OriginMatches(EffectRecord record, GameObject candidate, int displayId)
+        private static bool OriginMatches(EffectRecord record, UnityEngine.Object candidate, int displayId)
         {
             return NormalizedName(candidate) == record.OriginName && displayId == record.DisplayId;
         }
@@ -1286,8 +2164,8 @@ namespace PoECoop.Sync
             int displayId = -1;
             if (wanted is GenericAbility) displayId = ((GenericAbility)(object)wanted).DisplayName.StringID;
             else if (wanted is Equippable) displayId = ((Equippable)(object)wanted).DisplayName.StringID;
-            string name = NormalizedName(wanted.gameObject);
-            T[] components = owner.GetComponentsInChildren<T>(true);
+            string name = NormalizedName(wanted);
+            T[] components = ChildrenOf<T>(owner);
             int ordinal = 0;
             for (int i = 0; i < components.Length; i++)
             {
@@ -1295,7 +2173,7 @@ namespace PoECoop.Sync
                 int candidateId = -1;
                 if (component is GenericAbility) candidateId = ((GenericAbility)(object)component).DisplayName.StringID;
                 else if (component is Equippable) candidateId = ((Equippable)(object)component).DisplayName.StringID;
-                if (NormalizedName(component.gameObject) != name || candidateId != displayId) continue;
+                if (NormalizedName(component) != name || candidateId != displayId) continue;
                 if (component == wanted) return ordinal;
                 ordinal++;
             }
@@ -1305,23 +2183,23 @@ namespace PoECoop.Sync
         private static int FindPhraseOrdinal(GameObject owner, Phrase wanted)
         {
             if (owner == null || wanted == null) return 0;
-            string name = NormalizedName(wanted.gameObject);
+            string name = NormalizedName(wanted);
             int displayId = wanted.DisplayName.StringID;
             int ordinal = 0;
-            Phrase[] phrases = owner.GetComponentsInChildren<Phrase>(true);
+            Phrase[] phrases = ChildrenOf<Phrase>(owner);
             for (int i = 0; i < phrases.Length; i++)
             {
-                if (NormalizedName(phrases[i].gameObject) != name || phrases[i].DisplayName.StringID != displayId || phrases[i].Tag != wanted.Tag) continue;
+                if (NormalizedName(phrases[i]) != name || phrases[i].DisplayName.StringID != displayId || phrases[i].Tag != wanted.Tag) continue;
                 if (phrases[i] == wanted) return ordinal;
                 ordinal++;
             }
             ChanterTrait chanter = owner.GetComponent<ChanterTrait>();
             if (chanter != null)
             {
-                phrases = chanter.GetKnownPhrases();
+                phrases = KnownPhrasesOf(owner, chanter);
                 for (int i = 0; i < phrases.Length; i++)
                 {
-                    if (phrases[i] == null || NormalizedName(phrases[i].gameObject) != name || phrases[i].DisplayName.StringID != displayId || phrases[i].Tag != wanted.Tag) continue;
+                    if (phrases[i] == null || NormalizedName(phrases[i]) != name || phrases[i].DisplayName.StringID != displayId || phrases[i].Tag != wanted.Tag) continue;
                     if (phrases[i] == wanted) return ordinal;
                     ordinal++;
                 }
@@ -1385,10 +2263,47 @@ namespace PoECoop.Sync
         private static Guid GetId(GameObject go)
         {
             if (go == null) return Guid.Empty;
-            Guid id = EntityRegistry.NetworkId(go);
-            if (id != Guid.Empty) return id;
-            InstanceID instance = go.GetComponent<InstanceID>();
-            return instance != null ? instance.Guid : Guid.Empty;
+            int key = go.GetInstanceID();
+            Guid id;
+            if (s_passIds.TryGetValue(key, out id)) return id;
+            id = EntityRegistry.NetworkId(go);
+            if (id == Guid.Empty)
+            {
+                InstanceID instance = go.GetComponent<InstanceID>();
+                if (instance != null) id = instance.Guid;
+            }
+            s_passIds.Add(key, id);
+            return id;
+        }
+
+        private static T[] ChildrenOf<T>(GameObject owner) where T : Component
+        {
+            int key = owner.GetInstanceID();
+            T[] components;
+            if (!Children<T>.ByOwner.TryGetValue(key, out components))
+                Children<T>.ByOwner.Add(key, components = owner.GetComponentsInChildren<T>(true));
+            return components;
+        }
+
+        private static Phrase[] KnownPhrasesOf(GameObject owner, ChanterTrait chanter)
+        {
+            int key = owner.GetInstanceID();
+            Phrase[] phrases;
+            if (!s_passKnownPhrases.TryGetValue(key, out phrases))
+                s_passKnownPhrases.Add(key, phrases = chanter.GetKnownPhrases());
+            return phrases;
+        }
+
+        private static void ClearPassLookups()
+        {
+            Children<GenericAbility>.ByOwner.Clear();
+            Children<Equippable>.ByOwner.Clear();
+            Children<Phrase>.ByOwner.Clear();
+            s_passKnownPhrases.Clear();
+            s_passNames.Clear();
+            s_passIds.Clear();
+            s_passAfflictions.Clear();
+            s_passAfflictionsBuilt = false;
         }
 
         private static GameObject Resolve(Guid id)
@@ -1399,14 +2314,20 @@ namespace PoECoop.Sync
             return InstanceID.GetObjectByID(id);
         }
 
-        private static string NormalizedName(GameObject go)
+        /// <summary>The object's (for a component, its GameObject's) name without the clone suffix; read once per pass.</summary>
+        private static string NormalizedName(UnityEngine.Object go)
         {
             if (go == null) return "";
-            string name = go.name ?? "";
+            int key = go.GetInstanceID();
+            string name;
+            if (s_passNames.TryGetValue(key, out name)) return name;
+            name = go.name ?? "";
             const string clone = "(Clone)";
             int index = name.IndexOf(clone, StringComparison.Ordinal);
             if (index >= 0) name = name.Remove(index, clone.Length);
-            return name.Trim();
+            name = name.Trim();
+            s_passNames.Add(key, name);
+            return name;
         }
 
         private static string Describe(StatusEffect effect)
@@ -1424,26 +2345,76 @@ namespace PoECoop.Sync
             if (_guestWarnings.Add(key)) Plugin.Log?.LogWarning(text);
         }
 
+        // A cleaned string has at most maxLength UTF-16 units, which is never more than
+        // maxLength * 3 UTF-8 bytes, so the former maxLength * 4 byte bound cannot be exceeded.
         private static void WriteString(BinaryWriter writer, string value, int maxLength)
         {
-            value = Protocol.Clean(value, maxLength);
-            while (Encoding.UTF8.GetByteCount(value) > maxLength * 4) value = value.Substring(0, value.Length - 1);
-            writer.Write(value ?? "");
+            writer.Write(Clean(value, maxLength));
         }
 
         private static string ReadString(MessageReader reader, int maxLength)
         {
             string value = reader.String();
-            if (value.Length > maxLength || Encoding.UTF8.GetByteCount(value) > maxLength * 4)
-                throw new FormatException("status string exceeds its bound");
-            return Protocol.Clean(value, maxLength);
+            if (value.Length > maxLength) throw new FormatException("status string exceeds its bound");
+            return Clean(value, maxLength);
+        }
+
+        /// <summary>Protocol.Clean without its copy for text that is already clean, which is nearly all of it.</summary>
+        private static string Clean(string text, int maxLength)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            if (text.Length > maxLength || char.IsWhiteSpace(text[0]) || char.IsWhiteSpace(text[text.Length - 1]))
+                return Protocol.Clean(text, maxLength);
+            for (int i = 0; i < text.Length; i++)
+                if (char.IsControl(text[i])) return Protocol.Clean(text, maxLength);
+            return text;
+        }
+
+        private static void WriteGuid(BinaryWriter writer, Guid value)
+        {
+            // Same sixteen bytes as Guid.ToByteArray on the little-endian platforms the game runs on.
+            var bits = new GuidBits { Value = value };
+            writer.Write(bits.Low);
+            writer.Write(bits.High);
+        }
+
+        private static Guid ReadGuid(MessageReader reader)
+        {
+            var bits = new GuidBits();
+            bits.Low = reader.Long();
+            bits.High = reader.Long();
+            return bits.Value;
+        }
+
+        private static Action<StatusEffectParams, T> CreateSetter<T>(PropertyInfo property)
+        {
+            try
+            {
+                MethodInfo setter = property != null ? property.GetSetMethod(true) : null;
+                return setter != null ? (Action<StatusEffectParams, T>)Delegate.CreateDelegate(typeof(Action<StatusEffectParams, T>), setter) : null;
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
+        }
+
+        private static HashSet<int> EnumValues(Type type)
+        {
+            var values = new HashSet<int>();
+            foreach (object value in Enum.GetValues(type)) values.Add(Convert.ToInt32(value));
+            return values;
         }
 
         private static void WriteFloat(BinaryWriter writer, float value)
         {
-            if (float.IsNaN(value) || float.IsInfinity(value) || Math.Abs(value) > MaxMagnitude)
-                throw new InvalidDataException("non-finite or unbounded status float " + value);
+            RequireBounded(value);
             writer.Write(value);
+        }
+
+        private static void RequireBounded(float value)
+        {
+            if (!IsBounded(value)) throw new InvalidDataException("non-finite or unbounded status float " + value);
         }
 
         private static float ReadFloat(MessageReader reader)
@@ -1467,5 +2438,18 @@ namespace PoECoop.Sync
             for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
             return true;
         }
+    }
+
+    // Prefixes, so the set stays right when the game's own handler throws.
+    [HarmonyPatch(typeof(CharacterStats), "OnEnable")]
+    internal static class StatusTargetEnabledPatch
+    {
+        private static void Prefix(CharacterStats __instance) => StatusEffectSync.TrackEnabled(__instance);
+    }
+
+    [HarmonyPatch(typeof(CharacterStats), "OnDisable")]
+    internal static class StatusTargetDisabledPatch
+    {
+        private static void Prefix(CharacterStats __instance) => StatusEffectSync.TrackDisabled(__instance);
     }
 }

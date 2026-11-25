@@ -87,6 +87,11 @@ namespace PoECoop.UI
         private CSteamID _pendingInviterId;
         private string _pendingInviter = "";
         private string _pendingLobby = "";
+        private string _windowTitle;
+        private KeyCode _windowTitleKey;
+        private string _collapsedText;
+        private KeyCode _collapsedKey;
+        private int _collapsedKind = int.MinValue;
 
         public bool Visible { get; set; }
 
@@ -115,8 +120,10 @@ namespace PoECoop.UI
 
         public void Update()
         {
+            long perf = PerfStats.Begin();
             RunSteamActions();
             RefreshSteamSnapshot();
+            PerfStats.End("overlay.update", perf);
 
             if (_session.LinesVersion != _seenLines)
             {
@@ -140,6 +147,13 @@ namespace PoECoop.UI
 
         public void OnGUI()
         {
+            long perf = PerfStats.Begin();
+            DrawGui();
+            PerfStats.End("overlay.gui", perf);
+        }
+
+        private void DrawGui()
+        {
             var e = Event.current;
             if (e.type == EventType.KeyUp && e.keyCode == _settings.ToggleKey.Value)
             {
@@ -153,13 +167,18 @@ namespace PoECoop.UI
             }
 
             _scale = Mathf.Max(1f, Screen.height / 1080f);
-            GUI.matrix = Matrix4x4.Scale(new Vector3(_scale, _scale, 1f));
 
             if (!Visible)
             {
+                // The collapsed line is plain labels, which only do anything while repainting.
+                // OnGUI also runs for the layout pass and for every input event.
+                if (e.type != EventType.Repaint) return;
+                if (_session.State == SessionState.Offline && !_hasPendingInvite) return;
+                GUI.matrix = Matrix4x4.Scale(new Vector3(_scale, _scale, 1f));
                 DrawCollapsed();
                 return;
             }
+            GUI.matrix = Matrix4x4.Scale(new Vector3(_scale, _scale, 1f));
 
             // Enter in the chat box sends. Checked before the text field sees the key.
             if (e.type == EventType.KeyDown && (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
@@ -170,7 +189,13 @@ namespace PoECoop.UI
             }
 
             _window.height = 0; // let the layout pick the height
-            _window = GUILayout.Window(WindowId, _window, DrawWindow, "Co-op  (" + _settings.ToggleKey.Value + " hides)");
+            KeyCode toggle = _settings.ToggleKey.Value;
+            if (_windowTitle == null || toggle != _windowTitleKey)
+            {
+                _windowTitleKey = toggle;
+                _windowTitle = "Co-op  (" + toggle + " hides)";
+            }
+            _window = GUILayout.Window(WindowId, _window, DrawWindow, _windowTitle);
 
             if (e.type == EventType.Repaint)
                 SetKeyBlock(System.Array.IndexOf(TextFields, GUI.GetNameOfFocusedControl()) >= 0);
@@ -353,20 +378,32 @@ namespace PoECoop.UI
         private string MemberConnectionStatus(MemberRow member)
         {
             PlayerInfo player = null;
-            if (member.IsLocal) player = _session.Players.Find(p => p.Id == _session.LocalId);
-            else if (member.IsHost) player = _session.Players.Find(p => p.Id == Session.HostId);
+            if (member.IsLocal) player = PlayerById(_session.LocalId);
+            else if (member.IsHost) player = PlayerById(Session.HostId);
             if (player == null && _session.Players.Count == 2)
             {
                 foreach (var candidate in _session.Players)
                     if (candidate.Id != _session.LocalId && candidate.Id != Session.HostId) player = candidate;
             }
-            if (player == null) player = _session.Players.Find(p => p.Name == member.Name);
+            if (player == null)
+            {
+                foreach (var candidate in _session.Players)
+                    if (candidate.Name == member.Name) { player = candidate; break; }
+            }
             if (player == null) return "in lobby; handshake pending";
             if (_session.State == SessionState.Hosting)
                 return _session.IsPeerReady(player.Id) ? "handshake complete; world ready" : "handshake complete; loading world";
             if (player.Id == _session.LocalId)
                 return _session.IsWorldReady ? "handshake complete; world ready" : "handshake complete; loading world";
             return "handshake complete";
+        }
+
+        /// <summary>Drawn for every lobby member on every GUI event, so no delegate is built for the search.</summary>
+        private PlayerInfo PlayerById(int id)
+        {
+            foreach (var candidate in _session.Players)
+                if (candidate.Id == id) return candidate;
+            return null;
         }
 
         private void DrawFriends(bool canInvite)
@@ -492,20 +529,34 @@ namespace PoECoop.UI
         {
             if (_session.State == SessionState.Offline)
             {
-                if (_hasPendingInvite)
-                    GUI.Label(new Rect(12, 8, 600, 22), "Co-op: Steam invitation pending  [" + _settings.ToggleKey.Value + "]");
+                if (_hasPendingInvite) GUI.Label(new Rect(12, 8, 600, 22), CollapsedText(-2));
                 return;
             }
-            int count = _session.Players.Count;
-            string status = _session.State == SessionState.Connecting
-                ? "Co-op: connecting…"
-                : "Co-op: " + count + (count == 1 ? " player" : " players");
-            GUI.Label(new Rect(12, 8, 500, 22), status + "  [" + _settings.ToggleKey.Value + "]");
+            GUI.Label(new Rect(12, 8, 500, 22),
+                CollapsedText(_session.State == SessionState.Connecting ? -1 : _session.Players.Count));
 
             if (Time.unscaledTime - _lastLineTime > RecentLineSeconds) return;
             int first = Mathf.Max(0, _session.Lines.Count - 3);
             for (int i = first; i < _session.Lines.Count; i++)
                 GUI.Label(new Rect(12, 28 + (i - first) * 20, 700, 22), _session.Lines[i]);
+        }
+
+        /// <summary>
+        /// The status line for a player count, -1 while connecting or -2 for a pending
+        /// invitation. It is drawn every frame of normal play, so the text is kept
+        /// until what it says changes.
+        /// </summary>
+        private string CollapsedText(int kind)
+        {
+            KeyCode toggle = _settings.ToggleKey.Value;
+            if (_collapsedText != null && kind == _collapsedKind && toggle == _collapsedKey) return _collapsedText;
+            _collapsedKind = kind;
+            _collapsedKey = toggle;
+            string status = kind == -2 ? "Co-op: Steam invitation pending"
+                : kind == -1 ? "Co-op: connecting…"
+                : "Co-op: " + kind + (kind == 1 ? " player" : " players");
+            _collapsedText = status + "  [" + toggle + "]";
+            return _collapsedText;
         }
 
         private bool ReadForm(out int port)
@@ -681,8 +732,14 @@ namespace PoECoop.UI
 
         private void RefreshSteamSnapshot()
         {
-            _friends.Clear();
-            _members.Clear();
+            // The friend and member rows are only drawn in the window. While it is hidden
+            // they keep their last contents instead of being rebuilt from Steam every frame.
+            bool rows = Visible;
+            if (rows || _steam == null)
+            {
+                _friends.Clear();
+                _members.Clear();
+            }
             if (_steam == null)
             {
                 _steamAvailable = false;
@@ -705,10 +762,14 @@ namespace PoECoop.UI
                 _steamBusy = _steam.IsBusy;
                 if (_hasPendingInvite && _steam.CurrentLobby == _pendingInviteLobby) ClearPendingInvite();
                 _steamVisibility = _steam.Visibility ?? SteamLobbyVisibility.FriendsOnly;
-                foreach (var friend in _steam.OnlineFriends)
-                    _friends.Add(new FriendRow { Id = friend.SteamId, Name = friend.PersonaName });
+                if (rows)
+                {
+                    var friends = _steam.OnlineFriends;
+                    for (int i = 0; i < friends.Count; i++)
+                        _friends.Add(new FriendRow { Id = friends[i].SteamId, Name = friends[i].PersonaName });
+                }
 
-                if (_inSteamLobby && _steamAvailable)
+                if (rows && _inSteamLobby && _steamAvailable)
                 {
                     CSteamID local = SteamUser.GetSteamID();
                     int count = SteamMatchmaking.GetNumLobbyMembers(_steam.CurrentLobby);
@@ -735,6 +796,8 @@ namespace PoECoop.UI
             }
             catch (Exception ex)
             {
+                _friends.Clear();
+                _members.Clear();
                 _steamAvailable = false;
                 _inSteamLobby = false;
                 _steamBusy = false;

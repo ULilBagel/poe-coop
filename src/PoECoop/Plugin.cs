@@ -14,7 +14,7 @@ namespace PoECoop
     {
         public const string Guid = "poecoop";
         public const string Name = "PoE Co-op";
-        public const string Version = "0.9.0";
+        public const string Version = "0.10.0";
 
         internal static ManualLogSource Log;
 
@@ -32,6 +32,8 @@ namespace PoECoop
         private InventorySync _inventory;
         private InventoryCommands _inventoryCommands;
         private LootSync _loot;
+        private GroundLootSync _groundLoot;
+        private FactionStateSync _factions;
         private EntityRegistry _entities;
         private PositionSync _positions;
         private VitalsSync _vitals;
@@ -66,6 +68,7 @@ namespace PoECoop
             Log.LogInfo($"{Name} {Version} loaded. Unity {Application.unityVersion}, game {gameVersion}");
 
             _settings = new Settings(Config);
+            PerfStats.Start(Environment.GetCommandLineArgs(), Version, Log.LogInfo);
             string logFile = Arg(Environment.GetCommandLineArgs(), "--coop-log");
             if (logFile != null) System.IO.File.WriteAllText(logFile, "");
             Action<string> log = line =>
@@ -77,6 +80,9 @@ namespace PoECoop
             _steam = new SteamLobbyService(Version, gameVersion, HostSteamSession, JoinSteamSession, log);
             _steam.SessionStopRequested += _session.Leave;
             s_session = _session;
+            // Received work is spread over frames only in a loaded level with no world barrier up.
+            _session.CanDeferReceive = () => GameState.IsInGameSession && !GameState.IsInMainMenu
+                && !GameState.IsLoading && GameState.Instance != null && !FlowCoordinator.ApplyingWorldBarrier;
             _flow = new FlowCoordinator(_session);
             _handoff = new SaveHandoff(_session, this);
             _ownership = new Ownership(_session);
@@ -89,6 +95,8 @@ namespace PoECoop
             _inventory = new InventorySync(_session, _ownership);
             _inventoryCommands = new InventoryCommands(_session, _ownership);
             _loot = new LootSync(_session, _ownership);
+            _groundLoot = new GroundLootSync(_session, _ownership);
+            _factions = new FactionStateSync(_session);
             _positions = new PositionSync(_session);
             _vitals = new VitalsSync(_session);
             _combatState = new CombatStateSync(_session);
@@ -112,44 +120,63 @@ namespace PoECoop
 
         private void Update()
         {
+            PerfStats.BeginFrame();
+            float now = Time.unscaledTime;
             DevTools.KeepRunningWhenHidden();
             if (s_noEdgeScroll && GameState.Option != null && GameState.Option.GetOption(GameOption.BoolOption.SCREEN_EDGE_SCROLLING))
                 GameState.Option.SetOption(GameOption.BoolOption.SCREEN_EDGE_SCROLLING, false);
 
             DevTools.UpdateTrace("session");
-            _session.Update(Time.unscaledTime);
+            _session.Update(now);
             DevTools.UpdateTrace("flow");
-            _flow.Update(Time.unscaledTime);
+            _flow.Update(now);
             DevTools.UpdateTrace("handoff");
-            _handoff.Update(Time.unscaledTime);
+            _handoff.Update(now);
             DevTools.UpdateTrace("entities");
-            _entities.Update(Time.unscaledTime);
+            _entities.Update(now);
+            _factions.Update(now);
             DevTools.UpdateTrace("items");
-            _items.Update(Time.unscaledTime);
+            _items.Update(now);
             _inventory.SetWorldState(FlowCoordinator.WorldEpoch,
                 _session.IsWorldReady && !FlowCoordinator.ApplyingWorldBarrier);
-            _time.Update(Time.unscaledTime);
-            _dialogue.Update(Time.unscaledTime);
-            _areaTransitions.Update(Time.unscaledTime);
-            _rest.Update(Time.unscaledTime);
-            _inventory.Update(Time.unscaledTime);
-            _inventoryCommands.Update(Time.unscaledTime);
+            _time.Update(now);
+            _dialogue.Update(now);
+            _areaTransitions.Update(now);
+            _rest.Update(now);
+            _inventory.Update(now);
+            _inventoryCommands.Update(now);
             DevTools.UpdateTrace("loot");
-            _loot.Update(Time.unscaledTime);
+            _loot.Update(now);
+            _groundLoot.Update(now);
             DevTools.UpdateTrace("legacy-world");
-            _positions.Update(Time.unscaledTime);
-            _vitals.Update(Time.unscaledTime);
-            _combatState.Update(Time.unscaledTime);
-            _tacticalState.Update(Time.unscaledTime);
-            _statusEffects.Update(Time.unscaledTime);
-            _attackVisuals.Update(Time.unscaledTime);
-            _projectileVisuals.Update(Time.unscaledTime);
-            _combatLog.Update(Time.unscaledTime);
-            _abilityStates.Update(Time.unscaledTime);
+            _positions.Update(now);
+            _vitals.Update(now);
+            _combatState.Update(now);
+            _tacticalState.Update(now);
+            _statusEffects.Update(now);
+            _attackVisuals.Update(now);
+            _projectileVisuals.Update(now);
+            _combatLog.Update(now);
+            _abilityStates.Update(now);
             _ownership.Update();
             _orders.Collect();
             _steam.Update();
             _overlay.Update();
+            if (PerfStats.Enabled) EndPerfFrame();
+        }
+
+        private void EndPerfFrame()
+        {
+            string role;
+            switch (_session.State)
+            {
+                case SessionState.Hosting: role = "host"; break;
+                case SessionState.Joined: role = "guest"; break;
+                case SessionState.Connecting: role = "connecting"; break;
+                default: role = "offline"; break;
+            }
+            int peers = _session.Players.Count > 0 ? _session.Players.Count - 1 : 0;
+            PerfStats.EndFrame(role, peers, GameState.IsInGameSession && !GameState.IsLoading, GameState.IsLoading);
         }
 
         private void OnGUI() => _overlay.OnGUI();
@@ -169,6 +196,8 @@ namespace PoECoop
                 _steam.Dispose();
             }
             _tacticalOrders?.Dispose();
+            _factions?.Dispose();
+            _groundLoot?.Dispose();
             _loot?.Dispose();
             _inventoryCommands?.Dispose();
             _inventory?.Dispose();
@@ -190,6 +219,7 @@ namespace PoECoop
             _flow?.Dispose();
             _ownership?.Dispose();
             _session?.Dispose();
+            PerfStats.Stop();
         }
 
         private static string GameVersion()
@@ -222,6 +252,7 @@ namespace PoECoop
         ///   --coop-name NAME       player name for this run only
         ///   --coop-say TEXT        send TEXT once another player is in the session
         ///   --coop-log FILE        also write session lines to FILE (both copies share BepInEx's log)
+        ///   --coop-perf FILE       write timing and traffic diagnostics to FILE, one JSON line per second (Diagnostics/PerfStats.cs)
         ///   --coop-screenshot FILE save a screenshot every 15 seconds: FILE-1.png, FILE-2.png, ...
         ///   --coop-continue        load the most recent save as soon as the main menu is up
         ///   --coop-newgame         start a new game as soon as the main menu is up

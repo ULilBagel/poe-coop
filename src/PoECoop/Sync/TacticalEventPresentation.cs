@@ -66,20 +66,29 @@ namespace PoECoop.Sync
         private static readonly FieldInfo ActorStatsField = AccessTools.Field(typeof(TacticalEvent), "ActorStats");
         private static readonly FieldInfo ActorHealthField = AccessTools.Field(typeof(TacticalEvent), "ActorHealth");
         private static readonly FieldInfo ActorFactionField = AccessTools.Field(typeof(TacticalEvent), "ActorFaction");
-        private static readonly FieldInfo CastInitiativeField = AccessTools.Field(typeof(TacticalCastFinishedEvent), "m_initiativeDelay");
-        private static readonly FieldInfo CastAttackTimeField = AccessTools.Field(typeof(TacticalCastFinishedEvent), "m_initialAttackTime");
-        private static readonly FieldInfo RoundCountField = AccessTools.Field(typeof(TacticalRoundStartEvent), "m_RoundCount");
+        private static readonly AccessTools.FieldRef<TacticalCastFinishedEvent, float> CastInitiativeField =
+            AccessTools.FieldRefAccess<TacticalCastFinishedEvent, float>("m_initiativeDelay");
+        private static readonly AccessTools.FieldRef<TacticalCastFinishedEvent, float> CastAttackTimeField =
+            AccessTools.FieldRefAccess<TacticalCastFinishedEvent, float>("m_initialAttackTime");
+        private static readonly AccessTools.FieldRef<TacticalRoundStartEvent, int> RoundCountField =
+            AccessTools.FieldRefAccess<TacticalRoundStartEvent, int>("m_RoundCount");
         private static readonly FieldInfo TotalRoundsField = AccessTools.Field(typeof(TacticalRoundStartEvent), "TotalRounds");
         private static readonly MethodInfo ConsumeRoundMethod = AccessTools.Method(typeof(TacticalRoundStartEvent), "ConsumeRound");
         private static readonly FieldInfo ProjectileListField = AccessTools.Field(typeof(TacticalProjectileTurnEvent), "Projectiles");
         private static readonly FieldInfo ProjectileBiasField = AccessTools.Field(typeof(TacticalProjectileTurnEvent), "initiativeBias");
+        private static readonly Type TurnLockType =
+            TurnLocksField != null ? TurnLocksField.FieldType.GetGenericArguments()[0] : null;
 
         private readonly Session _session;
         private readonly Dictionary<int, TacticalEvent> _events = new Dictionary<int, TacticalEvent>();
-        private readonly Dictionary<int, TacticalEventRecord> _records = new Dictionary<int, TacticalEventRecord>();
+        private Dictionary<int, TacticalEventRecord> _records = new Dictionary<int, TacticalEventRecord>();
+        // The snapshot being applied, by event ID; swapped into _records afterwards.
+        private Dictionary<int, TacticalEventRecord> _incoming = new Dictionary<int, TacticalEventRecord>();
+        private readonly List<int> _staleIds = new List<int>();
         private readonly Dictionary<Guid, AIController> _appliedActors = new Dictionary<Guid, AIController>();
         private readonly List<int> _queue = new List<int>();
         private bool _hasSnapshot;
+        private int _lockCount;
         private int _activeEventId;
         private GameObject _cameraActor;
 
@@ -92,6 +101,7 @@ namespace PoECoop.Sync
         {
             Reset(false);
             _records.Clear();
+            _incoming.Clear();
             _queue.Clear();
             _appliedActors.Clear();
         }
@@ -112,6 +122,8 @@ namespace PoECoop.Sync
 
                 TacticalModeManager manager = TacticalModeManager.Instance;
                 if (manager == null) return false;
+                _incoming.Clear();
+                foreach (TacticalEventRecord record in snapshot.Events) _incoming[record.Id] = record;
                 bool orderChanged = OrderChanged(snapshot);
                 int previousActive = _activeEventId;
 
@@ -119,7 +131,7 @@ namespace PoECoop.Sync
                 ApplyManager(manager, snapshot);
                 ApplyActors(snapshot, resolved);
 
-                int activeEventId = snapshot.CurrentEventId != 0 && snapshot.Events.Find(e => e.Id == snapshot.CurrentEventId).Active
+                int activeEventId = snapshot.CurrentEventId != 0 && _incoming[snapshot.CurrentEventId].Active
                     ? snapshot.CurrentEventId : 0;
                 TacticalEvent current = snapshot.CurrentEventId != 0 && _events.TryGetValue(snapshot.CurrentEventId, out TacticalEvent found)
                     ? found : null;
@@ -166,14 +178,33 @@ namespace PoECoop.Sync
             ApplyTurnLocks(manager, snapshot.TurnLocks);
         }
 
+        /// <summary>
+        /// Writes only the manager timers of the snapshot already applied. Nothing
+        /// native reads them while the guest's manager update is blocked.
+        /// </summary>
+        internal bool ApplyTimers(float currentTimer, float realTimer, float spinUpTimer, float effectTime, List<float> locks)
+        {
+            using (TacticalStateSync.HostApplyScope())
+            {
+                if (!_hasSnapshot || locks.Count != _lockCount) return false;
+                TacticalModeManager manager = TacticalModeManager.Instance;
+                if (manager == null) return false;
+                CurrentEventTimerField(manager) = currentTimer;
+                CurrentEventRealTimerField(manager) = realTimer;
+                SpinUpTimerField(manager) = spinUpTimer;
+                manager.EffectTime = effectTime;
+                if (locks.Count > 0) ApplyTurnLocks(manager, locks);
+                return true;
+            }
+        }
+
         private static void ApplyTurnLocks(TacticalModeManager manager, List<float> locks)
         {
             if (!(TurnLocksField.GetValue(manager) is IList nativeLocks)) return;
-            nativeLocks.Clear();
-            Type lockType = TurnLocksField.FieldType.GetGenericArguments()[0];
+            if (nativeLocks.Count > 0) nativeLocks.Clear();
             foreach (float remaining in locks)
             {
-                object entry = Activator.CreateInstance(lockType, new object[] { new object() });
+                object entry = Activator.CreateInstance(TurnLockType, new object[] { new object() });
                 TurnLockTimeoutField.SetValue(entry, Time.time + remaining);
                 nativeLocks.Add(entry);
             }
@@ -182,10 +213,8 @@ namespace PoECoop.Sync
         private void ReconcileEvents(TacticalModeManager manager, TacticalResolvedSnapshot resolved)
         {
             TacticalSnapshot snapshot = resolved.Snapshot;
-            var required = new HashSet<int>();
             foreach (TacticalEventRecord record in snapshot.Events)
             {
-                required.Add(record.Id);
                 if (_events.TryGetValue(record.Id, out TacticalEvent existing) && !Matches(record, existing, resolved))
                 {
                     Teardown(existing);
@@ -200,15 +229,19 @@ namespace PoECoop.Sync
                 UpdateEvent(existing, record, resolved);
             }
 
-            List<int> stale = null;
-            foreach (int id in _events.Keys)
-                if (!required.Contains(id)) (stale ?? (stale = new List<int>())).Add(id);
-            if (stale != null)
+            if (_events.Count != snapshot.Events.Count)
+            {
+                List<int> stale = _staleIds;
+                stale.Clear();
+                foreach (int id in _events.Keys)
+                    if (!_incoming.ContainsKey(id)) stale.Add(id);
                 foreach (int id in stale)
                 {
                     Teardown(_events[id]);
                     _events.Remove(id);
                 }
+                stale.Clear();
+            }
 
             List<TacticalEvent> nativeEvents = EventsField(manager);
             if (nativeEvents == null)
@@ -273,11 +306,23 @@ namespace PoECoop.Sync
         private static void UpdateEvent(TacticalEvent tacticalEvent, TacticalEventRecord record, TacticalResolvedSnapshot resolved)
         {
             AIController actor = record.ActorId != Guid.Empty ? resolved.Actors[record.ActorId].Actor : null;
+            GameObject actorObject = actor != null ? actor.gameObject : null;
+            CharacterStats actorStats = actor != null ? actor.CharacterStats : null;
+            // The readonly actor fields are rewritten through reflection only when
+            // the event is bound to a different actor than the one already stored.
+            bool rebind = !ReferenceEquals(tacticalEvent.Actor, actor)
+                || !ReferenceEquals(tacticalEvent.ActorGameObject, actorObject)
+                || !ReferenceEquals(tacticalEvent.ActorStats, actorStats)
+                || actor == null && (!ReferenceEquals(tacticalEvent.ActorHealth, null)
+                    || !ReferenceEquals(tacticalEvent.ActorFaction, null));
             tacticalEvent.UpdateActor(actor);
-            ActorGameObjectField.SetValue(tacticalEvent, actor != null ? actor.gameObject : null);
-            ActorStatsField.SetValue(tacticalEvent, actor != null ? actor.CharacterStats : null);
-            ActorHealthField.SetValue(tacticalEvent, actor != null ? actor.GetComponent<Health>() : null);
-            ActorFactionField.SetValue(tacticalEvent, actor != null ? actor.GetComponent<Faction>() : null);
+            if (rebind)
+            {
+                ActorGameObjectField.SetValue(tacticalEvent, actorObject);
+                ActorStatsField.SetValue(tacticalEvent, actorStats);
+                ActorHealthField.SetValue(tacticalEvent, actor != null ? actor.GetComponent<Health>() : null);
+                ActorFactionField.SetValue(tacticalEvent, actor != null ? actor.GetComponent<Faction>() : null);
+            }
             tacticalEvent.IsActive = record.Active;
             tacticalEvent.UseSafeDestroy = record.SafeDestroy;
 
@@ -292,14 +337,14 @@ namespace PoECoop.Sync
             }
             else if (tacticalEvent is PresentationCastFinishedEvent cast)
             {
-                CastInitiativeField.SetValue(cast, record.InitiativeSort);
-                CastAttackTimeField.SetValue(cast, record.AttackTime);
+                CastInitiativeField(cast) = record.InitiativeSort;
+                CastAttackTimeField(cast) = record.AttackTime;
                 cast.HostPreview = record.Preview;
                 SetPresentationValues(cast, record);
             }
             else if (tacticalEvent is PresentationRoundStartEvent round)
             {
-                RoundCountField.SetValue(round, record.Round);
+                RoundCountField(round) = record.Round;
                 SetPresentationValues(round, record);
             }
             else if (tacticalEvent is PresentationDelayEvent delay)
@@ -372,6 +417,7 @@ namespace PoECoop.Sync
                 foreach (TacticalEvent tacticalEvent in _events.Values) Teardown(tacticalEvent);
                 _events.Clear();
                 _records.Clear();
+                _incoming.Clear();
                 _queue.Clear();
                 _hasSnapshot = false;
                 _activeEventId = 0;
@@ -448,8 +494,7 @@ namespace PoECoop.Sync
             {
                 int id = snapshot.Queue[i];
                 if (_queue[i] != id || !_records.TryGetValue(id, out TacticalEventRecord previous)) return true;
-                TacticalEventRecord next = snapshot.Events.Find(e => e.Id == id);
-                if (next == null || PresentationChanged(previous, next)) return true;
+                if (!_incoming.TryGetValue(id, out TacticalEventRecord next) || PresentationChanged(previous, next)) return true;
             }
             return false;
         }
@@ -458,8 +503,11 @@ namespace PoECoop.Sync
         {
             _queue.Clear();
             _queue.AddRange(snapshot.Queue);
-            _records.Clear();
-            foreach (TacticalEventRecord record in snapshot.Events) _records[record.Id] = record;
+            _lockCount = snapshot.TurnLocks.Count;
+            Dictionary<int, TacticalEventRecord> previous = _records;
+            _records = _incoming;
+            _incoming = previous;
+            _incoming.Clear();
             _hasSnapshot = true;
         }
 

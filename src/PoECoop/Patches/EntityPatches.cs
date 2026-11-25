@@ -11,7 +11,7 @@ namespace PoECoop.Patches
         private static bool Prefix(Encounter __instance)
         {
             if (!Plugin.IsGuest || EntityRegistry.IsApplying) return true;
-            EntityRegistry.ProbeBlocked("guest-block-encounter-spawn", __instance.gameObject);
+            if (EntityRegistry.Probing) EntityRegistry.ProbeBlocked("guest-block-encounter-spawn", __instance.gameObject);
             return false;
         }
 
@@ -27,7 +27,7 @@ namespace PoECoop.Patches
         private static bool Prefix(Encounter __instance)
         {
             if (!Plugin.IsGuest || EntityRegistry.IsApplying) return true;
-            EntityRegistry.ProbeBlocked("guest-block-encounter-force-spawn", __instance.gameObject);
+            if (EntityRegistry.Probing) EntityRegistry.ProbeBlocked("guest-block-encounter-force-spawn", __instance.gameObject);
             return false;
         }
     }
@@ -39,7 +39,7 @@ namespace PoECoop.Patches
         {
             if (Plugin.IsGuest && !EntityRegistry.IsApplying)
             {
-                EntityRegistry.ProbeBlocked("guest-block-encounter-despawn", __instance.gameObject);
+                if (EntityRegistry.Probing) EntityRegistry.ProbeBlocked("guest-block-encounter-despawn", __instance.gameObject);
                 return false;
             }
             __state = __instance.GetSpawnedList();
@@ -58,7 +58,7 @@ namespace PoECoop.Patches
         private static bool Prefix(Summon __instance)
         {
             if (!Plugin.IsGuest || EntityRegistry.IsApplying) return true;
-            EntityRegistry.ProbeBlocked("guest-block-perform-summoning", __instance.gameObject);
+            if (EntityRegistry.Probing) EntityRegistry.ProbeBlocked("guest-block-perform-summoning", __instance.gameObject);
             return false;
         }
     }
@@ -76,7 +76,7 @@ namespace PoECoop.Patches
         {
             if (Plugin.IsGuest && !EntityRegistry.IsApplying)
             {
-                EntityRegistry.ProbeBlocked("guest-block-summon-creature", __instance.gameObject);
+                if (EntityRegistry.Probing) EntityRegistry.ProbeBlocked("guest-block-summon-creature", __instance.gameObject);
                 return false;
             }
             __state = Plugin.IsGuest ? null : new List<Health>(EntityRegistry.Summons(__instance));

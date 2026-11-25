@@ -59,14 +59,17 @@ namespace PoECoop.Sync
 
         public void Update(float now)
         {
+            long started = PerfStats.Begin();
             SyncSession();
             if (_session.IsHost && _worldEpoch == 0) InitializeHostWorld();
             UpdateBarrier();
             if (_barrier)
             {
                 GameInput.BeginBlockAllKeys();
-                Time.timeScale = 0f;
+                if (Time.timeScale != 0f) Time.timeScale = 0f;
+                PerfStats.Count("flow.barrier_frames");
             }
+            PerfStats.End("flow.update", started);
         }
 
         public void Dispose()
@@ -472,7 +475,7 @@ namespace PoECoop.Sync
     {
         private static void Postfix()
         {
-            if (FlowCoordinator.ApplyingWorldBarrier) Time.timeScale = 0f;
+            if (FlowCoordinator.ApplyingWorldBarrier && Time.timeScale != 0f) Time.timeScale = 0f;
         }
     }
 

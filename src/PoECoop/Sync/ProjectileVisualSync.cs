@@ -16,6 +16,10 @@ namespace PoECoop.Sync
     {
         private const float SendInterval = 0.05f;
         private const float FullRefreshInterval = 3f;
+        // Added once after a forced refresh so the periodic refreshes of the snapshot streams do not share a frame.
+        private const float FullRefreshPhase = 2.55f;
+        private const float PrefabScanCacheSeconds = 1f;
+        private const int MaxPrefabScanCache = 64;
         private const float SlideSeconds = 0.07f;
         private const float FastProjectileVisibleSeconds = 0.1f;
         private const float MaxDestroyDelay = 30f;
@@ -47,6 +51,22 @@ namespace PoECoop.Sync
         private readonly List<int> _finishedGuest = new List<int>();
         private readonly List<GuestPulseEffect> _guestPulseEffects = new List<GuestPulseEffect>();
         private readonly Stack<CaptureFrame> _captureFrames = new Stack<CaptureFrame>();
+        private readonly List<HostProjectile> _sendSpawns = new List<HostProjectile>();
+        private readonly List<HostProjectile> _sendUpdates = new List<HostProjectile>();
+        private readonly List<HostProjectile> _sendRemoves = new List<HostProjectile>();
+        private readonly List<PulseRecord> _sendPulses = new List<PulseRecord>();
+        private readonly HashSet<int> _sendSpawnedIds = new HashSet<int>();
+        private readonly VisualMessage _incoming = new VisualMessage();
+        private readonly HashSet<int> _incomingFullIds = new HashSet<int>();
+        private readonly HashSet<int> _incomingSpawned = new HashSet<int>();
+        private readonly Dictionary<PrefabScanKey, PrefabScanResult> _prefabScans = new Dictionary<PrefabScanKey, PrefabScanResult>();
+        private readonly List<AttackRanged> _prefabCandidates = new List<AttackRanged>();
+
+        private static readonly List<MonoBehaviour> s_behaviourScratch = new List<MonoBehaviour>();
+        private static readonly List<Rigidbody> s_bodyScratch = new List<Rigidbody>();
+        private static readonly List<Collider> s_colliderScratch = new List<Collider>();
+        private static readonly List<Joint> s_jointScratch = new List<Joint>();
+        private static readonly List<Animator> s_animatorScratch = new List<Animator>();
 
         private GameObject _staging;
         private CaptureFrame _capture;
@@ -174,10 +194,43 @@ namespace PoECoop.Sync
         {
             public int Epoch, Sequence;
             public bool Full;
-            public List<SpawnRecord> Spawns;
-            public List<UpdateRecord> Updates;
-            public List<RemoveRecord> Removes;
-            public List<PulseRecord> Pulses;
+            public readonly List<SpawnRecord> Spawns = new List<SpawnRecord>();
+            public readonly List<UpdateRecord> Updates = new List<UpdateRecord>();
+            public readonly List<RemoveRecord> Removes = new List<RemoveRecord>();
+            public readonly List<PulseRecord> Pulses = new List<PulseRecord>();
+        }
+
+        /// <summary>The spawn fields the scene-wide attack search matches on.</summary>
+        private struct PrefabScanKey : IEquatable<PrefabScanKey>
+        {
+            public string AttackName, AttackType, PrefabName, AbilityName;
+            public int AbilityStringId;
+            public bool HasAbility;
+
+            public bool Equals(PrefabScanKey other)
+            {
+                return HasAbility == other.HasAbility && AbilityStringId == other.AbilityStringId
+                    && string.Equals(AttackName, other.AttackName, StringComparison.Ordinal)
+                    && string.Equals(AttackType, other.AttackType, StringComparison.Ordinal)
+                    && string.Equals(PrefabName, other.PrefabName, StringComparison.Ordinal)
+                    && string.Equals(AbilityName, other.AbilityName, StringComparison.Ordinal);
+            }
+
+            public override bool Equals(object obj) => obj is PrefabScanKey other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                int hash = AttackName != null ? AttackName.GetHashCode() : 0;
+                hash = hash * 31 + (PrefabName != null ? PrefabName.GetHashCode() : 0);
+                hash = hash * 31 + (AttackType != null ? AttackType.GetHashCode() : 0);
+                return hash * 31 + AbilityStringId;
+            }
+        }
+
+        private struct PrefabScanResult
+        {
+            public AttackRanged Attack;
+            public float Until;
         }
 
         public ProjectileVisualSync(Session session)
@@ -499,6 +552,13 @@ namespace PoECoop.Sync
         {
             if (now < _nextSend) return;
             _nextSend = now + SendInterval;
+            long perf = PerfStats.Begin();
+            SendHostState(now);
+            PerfStats.End("projectile.capture", perf);
+        }
+
+        private void SendHostState(float now)
+        {
             CaptureHostPoses();
 
             if (_session.Players.Count < 2 || !GameState.IsInGameSession || GameState.IsLoading)
@@ -506,13 +566,15 @@ namespace PoECoop.Sync
                 for (int i = _hostOrder.Count - 1; i >= 0; i--)
                 {
                     _hostOrder[i].Pulses.Clear();
-                    if (_hostOrder[i].Removed) RemoveHostState(_hostOrder[i]);
+                    if (_hostOrder[i].Removed) RemoveHostStateAt(i);
                 }
                 _pendingPulseCount = 0;
                 _nextFullRefresh = 0f;
                 return;
             }
 
+            // Zero marks a refresh forced by a join, a level change or a stream reset.
+            bool forced = _nextFullRefresh <= 0f;
             bool full = now >= _nextFullRefresh;
             if (_sequence == int.MaxValue)
             {
@@ -520,12 +582,18 @@ namespace PoECoop.Sync
                 _sequence = 0;
                 full = true;
             }
+            if (!full && _hostOrder.Count == 0) return;
 
-            var spawns = new List<HostProjectile>();
-            var updates = new List<HostProjectile>();
-            var removes = new List<HostProjectile>();
-            var spawnedIds = new HashSet<int>();
+            List<HostProjectile> spawns = _sendSpawns, updates = _sendUpdates, removes = _sendRemoves;
+            List<PulseRecord> pulses = _sendPulses;
+            HashSet<int> spawnedIds = _sendSpawnedIds;
+            spawns.Clear();
+            updates.Clear();
+            removes.Clear();
+            pulses.Clear();
+            spawnedIds.Clear();
             int spawnLimit = full ? MaxFullSpawns : MaxSpawnsPerMessage;
+            int unchanged = 0;
 
             for (int i = 0; i < _hostOrder.Count; i++)
             {
@@ -548,15 +616,14 @@ namespace PoECoop.Sync
                         if ((state.SpawnSent || spawnedIds.Contains(state.Id)) && removes.Count < MaxRemovesPerMessage)
                             removes.Add(state);
                     }
-                    else if (state.SpawnSent && !spawnedIds.Contains(state.Id) && updates.Count < MaxUpdatesPerMessage
-                        && (!state.HasSentPose || !Same(state.Sent, state.Current)))
+                    else if (state.SpawnSent && !spawnedIds.Contains(state.Id) && updates.Count < MaxUpdatesPerMessage)
                     {
-                        updates.Add(state);
+                        if (!state.HasSentPose || !Same(state.Sent, state.Current)) updates.Add(state);
+                        else unchanged++;
                     }
                 }
             }
 
-            var pulses = new List<PulseRecord>();
             for (int i = 0; i < _hostOrder.Count && pulses.Count < MaxPulsesPerMessage; i++)
             {
                 HostProjectile state = _hostOrder[i];
@@ -568,32 +635,44 @@ namespace PoECoop.Sync
                 }
             }
 
+            if (unchanged != 0) PerfStats.Count("projectile.skipped", unchanged);
             if (!full && spawns.Count == 0 && updates.Count == 0 && removes.Count == 0 && pulses.Count == 0) return;
             var message = new MessageWriter(MessageType.ProjectileVisuals)
                 .Int(_epoch).Int(_sequence++).Byte((byte)(full ? 1 : 0))
                 .Int(spawns.Count).Int(updates.Count).Int(removes.Count).Int(pulses.Count);
-            foreach (HostProjectile state in spawns) WriteSpawn(message, state);
-            foreach (HostProjectile state in updates) WriteUpdate(message, state);
-            foreach (HostProjectile state in removes) WriteRemove(message, state);
-            foreach (PulseRecord pulse in pulses) WritePulse(message, pulse);
+            for (int i = 0; i < spawns.Count; i++) WriteSpawn(message, spawns[i]);
+            for (int i = 0; i < updates.Count; i++) WriteUpdate(message, updates[i]);
+            for (int i = 0; i < removes.Count; i++) WriteRemove(message, removes[i]);
+            for (int i = 0; i < pulses.Count; i++) WritePulse(message, pulses[i]);
             _session.SendToGuests(message.ToArray());
+            PerfStats.Count(full ? "projectile.full" : "projectile.delta");
+            PerfStats.Count("projectile.records", spawns.Count + updates.Count + removes.Count + pulses.Count);
 
-            foreach (HostProjectile state in spawns)
+            for (int i = 0; i < spawns.Count; i++)
             {
+                HostProjectile state = spawns[i];
                 state.SpawnSent = true;
                 state.Sent = state.Current;
                 state.HasSentPose = true;
             }
-            foreach (HostProjectile state in updates)
+            for (int i = 0; i < updates.Count; i++)
             {
+                HostProjectile state = updates[i];
                 state.Sent = state.Current;
                 state.HasSentPose = true;
             }
-            foreach (HostProjectile state in removes) state.RemoveSent = true;
+            for (int i = 0; i < removes.Count; i++) removes[i].RemoveSent = true;
             for (int i = _hostOrder.Count - 1; i >= 0; i--)
-                if (_hostOrder[i].RemoveSent || (full && _hostOrder[i].Removed)) RemoveHostState(_hostOrder[i]);
+                if (_hostOrder[i].RemoveSent || (full && _hostOrder[i].Removed)) RemoveHostStateAt(i);
 
-            _nextFullRefresh = full ? now + FullRefreshInterval : _nextFullRefresh;
+            // The scratch lists must not keep finished projectiles alive while the stream is idle.
+            spawns.Clear();
+            updates.Clear();
+            removes.Clear();
+            pulses.Clear();
+            spawnedIds.Clear();
+
+            if (full) _nextFullRefresh = now + FullRefreshInterval + (forced ? FullRefreshPhase : 0f);
         }
 
         private void CaptureHostPoses()
@@ -657,11 +736,12 @@ namespace PoECoop.Sync
                 && Mathf.Abs(1f - Mathf.Abs(Quaternion.Dot(a.Rotation, b.Rotation))) < 0.00001f;
         }
 
-        private void RemoveHostState(HostProjectile state)
+        private void RemoveHostStateAt(int index)
         {
+            HostProjectile state = _hostOrder[index];
             _pendingPulseCount -= state.Pulses.Count;
             state.Pulses.Clear();
-            _hostOrder.Remove(state);
+            _hostOrder.RemoveAt(index);
             _hostById.Remove(state.Id);
             if ((object)state.Object != null) _hostByObject.Remove(state.Object);
         }
@@ -671,7 +751,13 @@ namespace PoECoop.Sync
         private void OnGameMessage(PlayerInfo sender, MessageReader reader)
         {
             if (sender != null || reader.Type != MessageType.ProjectileVisuals || !_session.IsGuest) return;
-            VisualMessage message = ReadMessage(reader);
+            long perf = PerfStats.Begin();
+            try { ApplyMessage(ReadMessage(reader, _incoming)); }
+            finally { PerfStats.End("projectile.apply", perf); }
+        }
+
+        private void ApplyMessage(VisualMessage message)
+        {
             if (_guestEpoch == message.Epoch && message.Sequence <= _guestSequence) return;
 
             bool newEpoch = _guestEpoch != message.Epoch || (message.Sequence == 0 && _guestSequence > 0);
@@ -684,14 +770,18 @@ namespace PoECoop.Sync
                 return;
             }
 
-            HashSet<int> fullIds = null;
-            if (message.Full)
-            {
-                fullIds = new HashSet<int>();
-                foreach (SpawnRecord spawn in message.Spawns) fullIds.Add(spawn.Id);
-            }
+            PerfStats.Count(message.Full ? "projectile.full" : "projectile.delta");
+            PerfStats.Count("projectile.records",
+                message.Spawns.Count + message.Updates.Count + message.Removes.Count + message.Pulses.Count);
+            int skipped = 0;
 
-            var spawned = new HashSet<int>();
+            HashSet<int> fullIds = _incomingFullIds;
+            fullIds.Clear();
+            if (message.Full)
+                foreach (SpawnRecord spawn in message.Spawns) fullIds.Add(spawn.Id);
+
+            HashSet<int> spawned = _incomingSpawned;
+            spawned.Clear();
             foreach (SpawnRecord spawn in message.Spawns)
             {
                 if (_guest.TryGetValue(spawn.Id, out GuestProjectile old))
@@ -715,10 +805,15 @@ namespace PoECoop.Sync
                     spawned.Add(spawn.Id);
                     _guestSkipLogged.Remove(spawn.Id);
                 }
+                else skipped++;
             }
             foreach (UpdateRecord update in message.Updates)
             {
-                if (!_guest.TryGetValue(update.Id, out GuestProjectile visual) || visual.Object == null || visual.Removing) continue;
+                if (!_guest.TryGetValue(update.Id, out GuestProjectile visual) || visual.Object == null || visual.Removing)
+                {
+                    skipped++;
+                    continue;
+                }
                 visual.From = ReadLocalPose(visual.Object.transform, update.Pose);
                 visual.To = update.Pose;
                 visual.Remaining = SlideSeconds;
@@ -729,8 +824,9 @@ namespace PoECoop.Sync
                     || !PulseIsNewer(pulse.Sequence, visual.LastPulseSequence)) continue;
                 visual.LastPulseSequence = pulse.Sequence;
                 if (pulse.Effect != PulseEffectKind.None) CreateGuestPulseEffect(visual, pulse);
-                ProbeGuest("pulse-" + pulse.Phase.ToString().ToLowerInvariant(), visual.Spawn, visual,
-                    "sequence=" + pulse.Sequence + ",effect=" + pulse.Effect);
+                if (_probe)
+                    ProbeGuest("pulse-" + pulse.Phase.ToString().ToLowerInvariant(), visual.Spawn, visual,
+                        "sequence=" + pulse.Sequence + ",effect=" + pulse.Effect);
             }
             foreach (RemoveRecord remove in message.Removes)
             {
@@ -766,13 +862,18 @@ namespace PoECoop.Sync
                     DestroyPulseEffectsFor(id);
                     _guest.Remove(id);
                 }
-                _guestSkipLogged.RemoveWhere(id => !fullIds.Contains(id));
+                if (_guestSkipLogged.Count > 0) _guestSkipLogged.RemoveWhere(id => !fullIds.Contains(id));
                 _finishedGuest.Clear();
             }
+            if (skipped != 0) PerfStats.Count("projectile.skipped", skipped);
         }
 
-        private static VisualMessage ReadMessage(MessageReader reader)
+        private static VisualMessage ReadMessage(MessageReader reader, VisualMessage message)
         {
+            message.Spawns.Clear();
+            message.Updates.Clear();
+            message.Removes.Clear();
+            message.Pulses.Clear();
             int epoch = reader.Int();
             int sequence = reader.Int();
             byte full = reader.Byte();
@@ -786,16 +887,9 @@ namespace PoECoop.Sync
             if (removeCount < 0 || removeCount > MaxRemovesPerMessage) throw new FormatException("projectile remove count " + removeCount);
             if (pulseCount < 0 || pulseCount > MaxPulsesPerMessage) throw new FormatException("projectile pulse count " + pulseCount);
 
-            var message = new VisualMessage
-            {
-                Epoch = epoch,
-                Sequence = sequence,
-                Full = full != 0,
-                Spawns = new List<SpawnRecord>(spawnCount),
-                Updates = new List<UpdateRecord>(updateCount),
-                Removes = new List<RemoveRecord>(removeCount),
-                Pulses = new List<PulseRecord>(pulseCount),
-            };
+            message.Epoch = epoch;
+            message.Sequence = sequence;
+            message.Full = full != 0;
             for (int i = 0; i < spawnCount; i++)
             {
                 var spawn = new SpawnRecord
@@ -978,11 +1072,16 @@ namespace PoECoop.Sync
 
         private static bool HasGameplayComponents(GameObject clone)
         {
-            return clone.GetComponentsInChildren<MonoBehaviour>(true).Length != 0
-                || clone.GetComponentsInChildren<Rigidbody>(true).Length != 0
-                || clone.GetComponentsInChildren<Collider>(true).Length != 0
-                || clone.GetComponentsInChildren<Joint>(true).Length != 0
-                || clone.GetComponentsInChildren<Animator>(true).Length != 0;
+            return HasAny(clone, s_behaviourScratch) || HasAny(clone, s_bodyScratch) || HasAny(clone, s_colliderScratch)
+                || HasAny(clone, s_jointScratch) || HasAny(clone, s_animatorScratch);
+        }
+
+        private static bool HasAny<T>(GameObject clone, List<T> scratch)
+        {
+            clone.GetComponentsInChildren(true, scratch);
+            bool any = scratch.Count != 0;
+            scratch.Clear();
+            return any;
         }
 
         private void CreateGuestPulseEffect(GuestProjectile visual, PulseRecord pulse)
@@ -1115,6 +1214,14 @@ namespace PoECoop.Sync
 
         private void UpdateGuest(float now)
         {
+            if (_guest.Count == 0 && _guestPulseEffects.Count == 0) return;
+            long perf = PerfStats.Begin();
+            AdvanceGuest(now);
+            PerfStats.End("projectile.update", perf);
+        }
+
+        private void AdvanceGuest(float now)
+        {
             UpdateGuestPulseEffects(now);
             _finishedGuest.Clear();
             foreach (var pair in _guest)
@@ -1222,10 +1329,17 @@ namespace PoECoop.Sync
 
         // ---- prefab and entity lookup ----
 
-        private static Projectile ResolvePrefab(SpawnRecord spawn, out AttackRanged matchedAttack)
+        private Projectile ResolvePrefab(SpawnRecord spawn, out AttackRanged matchedAttack)
         {
             matchedAttack = null;
-            var candidates = new List<AttackRanged>();
+            List<AttackRanged> candidates = _prefabCandidates;
+            candidates.Clear();
+            try { return ResolvePrefab(spawn, candidates, ref matchedAttack); }
+            finally { candidates.Clear(); }
+        }
+
+        private Projectile ResolvePrefab(SpawnRecord spawn, List<AttackRanged> candidates, ref AttackRanged matchedAttack)
+        {
             GameObject attackObject = Resolve(spawn.AttackId);
             if (attackObject != null) AddMatching(candidates, attackObject.GetComponentsInChildren<AttackRanged>(true), spawn);
             Projectile direct = UniquePrefab(candidates, ref matchedAttack);
@@ -1257,9 +1371,41 @@ namespace PoECoop.Sync
                 if (fromSource != null) return fromSource;
             }
 
+            return ScanForPrefab(spawn, candidates, ref matchedAttack);
+        }
+
+        /// <summary>
+        /// Last resort: search every loaded attack. The outcome is remembered briefly per
+        /// attack identity so a volley, or a refresh full of projectiles that cannot be
+        /// resolved, costs one scene search instead of one per projectile.
+        /// </summary>
+        private Projectile ScanForPrefab(SpawnRecord spawn, List<AttackRanged> candidates, ref AttackRanged matchedAttack)
+        {
+            var key = new PrefabScanKey
+            {
+                AttackName = spawn.AttackName,
+                AttackType = spawn.AttackType,
+                PrefabName = spawn.PrefabName,
+                AbilityName = spawn.HasAbility ? spawn.AbilityName : "",
+                AbilityStringId = spawn.HasAbility ? spawn.AbilityStringId : -1,
+                HasAbility = spawn.HasAbility,
+            };
+            float now = Time.unscaledTime;
             candidates.Clear();
+            if (_prefabScans.TryGetValue(key, out PrefabScanResult cached) && now < cached.Until)
+            {
+                if ((object)cached.Attack == null) return null;
+                AddMatching(candidates, cached.Attack, spawn);
+                if (candidates.Count == 1) return UniquePrefab(candidates, ref matchedAttack);
+                candidates.Clear();
+            }
+
+            PerfStats.Count("projectile.scan");
             AddMatching(candidates, UnityEngine.Object.FindObjectsOfType<AttackRanged>(), spawn);
-            return UniquePrefab(candidates, ref matchedAttack);
+            Projectile prefab = UniquePrefab(candidates, ref matchedAttack);
+            if (_prefabScans.Count >= MaxPrefabScanCache && !_prefabScans.ContainsKey(key)) _prefabScans.Clear();
+            _prefabScans[key] = new PrefabScanResult { Attack = prefab != null ? matchedAttack : null, Until = now + PrefabScanCacheSeconds };
+            return prefab;
         }
 
         private static void AddMatching(List<AttackRanged> candidates, AttackRanged[] attacks, SpawnRecord spawn)
@@ -1306,8 +1452,7 @@ namespace PoECoop.Sync
             int occurrence = 0;
             foreach (GenericAbility ability in source.GetComponentsInChildren<GenericAbility>(true))
             {
-                if (ability == null || !NameEquals(ability.gameObject.name, spawn.AbilityName)
-                    || ability.DisplayName.StringID != spawn.AbilityStringId) continue;
+                if (ability == null || !IsAbility(ability, spawn.AbilityName, spawn.AbilityStringId)) continue;
                 if (occurrence++ == spawn.AbilityOccurrence) return ability;
             }
             return null;
@@ -1317,15 +1462,23 @@ namespace PoECoop.Sync
         {
             if (source == null) return 0;
             string name = NormalizeName(wanted.gameObject.name);
+            int stringId = wanted.DisplayName.StringID;
             int occurrence = 0;
             foreach (GenericAbility ability in source.GetComponentsInChildren<GenericAbility>(true))
             {
-                if (ability == null || !NameEquals(ability.gameObject.name, name)
-                    || ability.DisplayName.StringID != wanted.DisplayName.StringID) continue;
+                if (ability == null || !IsAbility(ability, name, stringId)) continue;
                 if (ability == wanted) return occurrence;
                 occurrence++;
             }
             return 0;
+        }
+
+        /// <summary>Same test as name-then-string-id, but the integer rejects most abilities before a name is copied out of Unity.</summary>
+        private static bool IsAbility(GenericAbility ability, string normalizedName, int stringId)
+        {
+            DatabaseString display = ability.DisplayName;
+            if (display != null && display.StringID != stringId) return false;
+            return NameEquals(ability.gameObject.name, normalizedName) && ability.DisplayName.StringID == stringId;
         }
 
         private static Guid IdOf(GameObject obj)
@@ -1435,6 +1588,7 @@ namespace PoECoop.Sync
             _guest.Clear();
             _guestSkipLogged.Clear();
             _finishedGuest.Clear();
+            _prefabScans.Clear();
         }
 
         private static void DestroyGuestObject(GuestProjectile visual)

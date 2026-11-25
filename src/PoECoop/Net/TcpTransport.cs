@@ -12,11 +12,13 @@ namespace PoECoop.Net
     /// Direct connection by IP address. Each message is sent as a 4-byte
     /// little-endian length followed by the payload.
     /// </summary>
-    public sealed class TcpTransport : ITransport
+    public sealed class TcpTransport : ITransport, ITransportStats
     {
         public const int MaxMessageSize = TransportLimits.MaxMessageSize;
 
         private const int ConnectTimeoutMs = 5000;
+        // One socket call carries or fetches every message that fits, not one header and one body each.
+        private const int IoBufferSize = 64 << 10;
 
         private readonly ConcurrentQueue<QueuedEvent> _events = new ConcurrentQueue<QueuedEvent>();
         private int _queuedIncomingBytes;
@@ -29,6 +31,31 @@ namespace PoECoop.Net
 
         public string DisplayName => "Direct IP";
         public string Status { get; private set; } = "Direct IP";
+
+        public int PendingIncomingMessages => Volatile.Read(ref _queuedIncomingMessages);
+        public long PendingIncomingBytes => Volatile.Read(ref _queuedIncomingBytes);
+
+        public int PendingOutgoingMessages
+        {
+            get
+            {
+                int total = 0;
+                lock (_lock)
+                    foreach (var link in _links.Values) total += link.OutgoingMessages;
+                return total;
+            }
+        }
+
+        public long PendingOutgoingBytes
+        {
+            get
+            {
+                long total = 0;
+                lock (_lock)
+                    foreach (var link in _links.Values) total += link.OutgoingBytes;
+                return total;
+            }
+        }
 
         public void Host(int port)
         {
@@ -64,22 +91,27 @@ namespace PoECoop.Net
 
         public bool Poll(out TransportEvent e)
         {
+            long started = PerfStats.Begin();
             QueuedEvent queued;
             if (!_events.TryDequeue(out queued))
             {
                 e = default(TransportEvent);
+                PerfStats.End("transport.poll", started);
                 return false;
             }
             e = queued.Event;
             if (queued.IncomingBytes != 0) ReleaseIncoming(queued.Source, queued.IncomingBytes);
+            PerfStats.End("transport.poll", started);
             return true;
         }
 
         public void Send(int connection, byte[] message)
         {
+            long started = PerfStats.Begin();
             Link link;
             lock (_lock) _links.TryGetValue(connection, out link);
             if (link != null && !link.Enqueue(message)) link.Close("outgoing queue limit or invalid message");
+            PerfStats.End("transport.send", started);
         }
 
         public void Disconnect(int connection)
@@ -227,11 +259,16 @@ namespace PoECoop.Net
             private readonly TcpTransport _owner;
             private readonly TcpClient _client;
             private readonly NetworkStream _stream;
+            private readonly byte[] _readBuffer = new byte[IoBufferSize];
+            private int _readPosition;
+            private int _readEnd;
             private int _outgoingBytes;
             private int _outgoingMessages;
             private int _closed;
 
             public bool IsClosed => Volatile.Read(ref _closed) != 0;
+            public int OutgoingBytes => Volatile.Read(ref _outgoingBytes);
+            public int OutgoingMessages => Volatile.Read(ref _outgoingMessages);
 
             public Link(TcpTransport owner, int id, TcpClient client)
             {
@@ -301,25 +338,57 @@ namespace PoECoop.Net
 
             public void SendLoop()
             {
-                var header = new byte[4];
+                var buffer = new byte[IoBufferSize];
                 try
                 {
-                    foreach (var message in _outgoing.GetConsumingEnumerable())
+                    byte[] message;
+                    while (_outgoing.TryTake(out message, Timeout.Infinite))
                     {
-                        int n = message.Length;
-                        header[0] = (byte)n; header[1] = (byte)(n >> 8); header[2] = (byte)(n >> 16); header[3] = (byte)(n >> 24);
-                        _stream.Write(header, 0, 4);
-                        _stream.Write(message, 0, n);
-                        lock (_outgoingLock)
+                        // Coalesce everything already queued: same bytes in the same order, fewer segments.
+                        int used = 0, bytes = 0, messages = 0;
+                        do
                         {
-                            _outgoingBytes -= n;
-                            _outgoingMessages--;
+                            int n = message.Length;
+                            if (used != 0 && n + 4 > buffer.Length - used)
+                            {
+                                _stream.Write(buffer, 0, used);
+                                Sent(bytes, messages);
+                                used = 0; bytes = 0; messages = 0;
+                            }
+                            buffer[used] = (byte)n; buffer[used + 1] = (byte)(n >> 8);
+                            buffer[used + 2] = (byte)(n >> 16); buffer[used + 3] = (byte)(n >> 24);
+                            if (n + 4 > buffer.Length)
+                            {
+                                _stream.Write(buffer, 0, 4);
+                                _stream.Write(message, 0, n);
+                                Sent(n, 1);
+                                continue;
+                            }
+                            Buffer.BlockCopy(message, 0, buffer, used + 4, n);
+                            used += n + 4;
+                            bytes += n;
+                            messages++;
+                        }
+                        while (_outgoing.TryTake(out message));
+                        if (used != 0)
+                        {
+                            _stream.Write(buffer, 0, used);
+                            Sent(bytes, messages);
                         }
                     }
                 }
                 catch (Exception ex)
                 {
                     Close(Reason(ex));
+                }
+            }
+
+            private void Sent(int bytes, int messages)
+            {
+                lock (_outgoingLock)
+                {
+                    _outgoingBytes -= bytes;
+                    _outgoingMessages -= messages;
                 }
             }
 
@@ -336,9 +405,26 @@ namespace PoECoop.Net
                 int done = 0;
                 while (done < count)
                 {
-                    int got = _stream.Read(buffer, done, count - done);
+                    int buffered = _readEnd - _readPosition;
+                    if (buffered > 0)
+                    {
+                        int take = Math.Min(buffered, count - done);
+                        Buffer.BlockCopy(_readBuffer, _readPosition, buffer, done, take);
+                        _readPosition += take;
+                        done += take;
+                        continue;
+                    }
+                    if (count - done >= _readBuffer.Length)
+                    {
+                        int direct = _stream.Read(buffer, done, count - done);
+                        if (direct <= 0) return false;
+                        done += direct;
+                        continue;
+                    }
+                    int got = _stream.Read(_readBuffer, 0, _readBuffer.Length);
                     if (got <= 0) return false;
-                    done += got;
+                    _readPosition = 0;
+                    _readEnd = got;
                 }
                 return true;
             }
