@@ -69,6 +69,8 @@ namespace PoECoop.Sync
 
         // Host: a full manifest is sent when forced, when anything changed since the last one, or at the integrity interval.
         private bool _forceFull = true;
+        /// <summary>Host: encounter spawns have to be read again because a level change emptied the registry.</summary>
+        private bool _recaptureEncounters;
         private bool _changedSinceFull;
         private float _nextIntegrity;
 
@@ -280,6 +282,7 @@ namespace PoECoop.Sync
 
         private void UpdateHost(float now)
         {
+            if (_recaptureEncounters && !GameState.IsLoading && GameState.IsInGameSession) RecaptureEncounters();
             long started = PerfStats.Begin();
             RemoveDestroyed();
             bool connected = _session.Players.Count >= 2 && GameState.IsInGameSession && !GameState.IsLoading;
@@ -466,6 +469,7 @@ namespace PoECoop.Sync
             _forceFull = true;
             _changedSinceFull = false;
             _nextRetry = 0f;
+            _recaptureEncounters = true;
             _byId.Clear();
             _byObject.Clear();
             _projectiles.Clear();
@@ -618,6 +622,27 @@ namespace PoECoop.Sync
                 if (registered != Guid.Empty && self._byId.TryGetValue(registered, out Entity entity))
                     self.ProbeEvent("host-encounter-spawn", entity.Definition, obj.name);
             }
+        }
+
+        /// <summary>
+        /// Encounters that spawn while a level loads are captured before the level-loaded reset empties
+        /// the registry. Registered again by id alone they would lose their recipe, and a guest, which
+        /// never spawns encounters itself, could not create the ones that are not part of the scene.
+        /// </summary>
+        private void RecaptureEncounters()
+        {
+            _recaptureEncounters = false;
+            long started = PerfStats.Begin();
+            Encounter[] all = Resources.FindObjectsOfTypeAll<Encounter>();
+            for (int i = 0; i < all.Length; i++)
+            {
+                Encounter encounter = all[i];
+                if (encounter == null || !encounter.gameObject.scene.IsValid()) continue;
+                List<GameObject> spawned = EncounterSpawned(encounter);
+                if (spawned == null || spawned.Count == 0) continue;
+                CaptureEncounter(encounter);
+            }
+            PerfStats.End("entity.scan", started);
         }
 
         private Guid Register(GameObject obj, Origin origin, Guid parent, int slot, GameObject prefab, Guid requiredId)
