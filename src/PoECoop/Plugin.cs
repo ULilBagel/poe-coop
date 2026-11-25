@@ -14,7 +14,7 @@ namespace PoECoop
     {
         public const string Guid = "poecoop";
         public const string Name = "PoE Co-op";
-        public const string Version = "0.10.0";
+        public const string Version = "0.10.1";
 
         internal static ManualLogSource Log;
 
