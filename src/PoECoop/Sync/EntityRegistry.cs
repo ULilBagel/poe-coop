@@ -22,8 +22,13 @@ namespace PoECoop.Sync
         private const int MaxAbilityKeyLength = 96;
         private const float FullRefreshInterval = 3f;
         private const float RetryInterval = 0.25f;
-        private const float MaxRetryInterval = 4f;
-        private const int MaxRetryDoublings = 4;
+        // An entity that stays unresolved repeats a search of the whole scene on every attempt, so
+        // the gap keeps doubling up to this. A new binding still retries at once, and the host's
+        // full manifest (every 12 s) attempts every pending entity regardless.
+        private const float MaxRetryInterval = 32f;
+        private const int MaxRetryDoublings = 7;
+        /// <summary>Failed attempts (about two seconds) before an unresolved entity is named in the log, once.</summary>
+        private const int UnresolvedLogAttempts = 4;
         /// <summary>An unchanged manifest is only re-sent this often; changes still go out as deltas at once.</summary>
         private const float IntegrityInterval = 12f;
         private const float ForcedRefreshPhase = 0.45f;
@@ -54,6 +59,7 @@ namespace PoECoop.Sync
         private readonly HashSet<Guid> _dirty = new HashSet<Guid>();
         private readonly HashSet<Guid> _removed = new HashSet<Guid>();
         private readonly HashSet<Guid> _pending = new HashSet<Guid>();
+        private readonly HashSet<Guid> _unresolvedLogged = new HashSet<Guid>();
         private readonly HashSet<GameObject> _projectiles = new HashSet<GameObject>();
         private int _epoch = 1;
         private int _revision;
@@ -226,7 +232,21 @@ namespace PoECoop.Sync
                 return self._projectiles.Count > 0 && self._projectiles.Contains(obj) ? Guid.Empty : known;
             if (obj.GetComponent<Projectile>() != null) return Guid.Empty;
             if (self == null) return ReadSavedId(obj);
+            // The inventory and level-up screens show a copy of the character. It exists only in
+            // that player's interface: announced as a world entity, every guest would search its
+            // scene again and again for something it can never have.
+            if (obj.layer == PaperdollLayer) return Guid.Empty;
             return self.Register(obj, Origin.Prefab, Guid.Empty, 0, (string)null, Guid.Empty);
+        }
+
+        private static int s_paperdollLayer = int.MinValue;
+        private static int PaperdollLayer
+        {
+            get
+            {
+                if (s_paperdollLayer == int.MinValue) s_paperdollLayer = LayerMask.NameToLayer("Paperdoll");
+                return s_paperdollLayer;
+            }
         }
 
         /// <summary>Resolves active and inactive registered objects, then falls back to the game's saved-id table.</summary>
@@ -374,7 +394,13 @@ namespace PoECoop.Sync
                     PerfStats.Count("entity.retry");
                     if (ApplyDefinition(entity.Definition)) continue;
                     // Nothing can be created while loading, so waiting there is not a failure.
-                    if (settled && entity.Attempts < MaxRetryDoublings) entity.Attempts++;
+                    if (settled && entity.Attempts < MaxRetryDoublings && ++entity.Attempts == UnresolvedLogAttempts
+                        && _unresolvedLogged.Add(id))
+                    {
+                        Definition d = entity.Definition;
+                        Plugin.Log?.LogWarning("Entity " + id + " (" + d.Origin + ", " + d.PrefabKey + ", active " + d.Active
+                            + ") from the host cannot be found or created here; retrying less and less often.");
+                    }
                     entity.NextAttempt = now + Mathf.Min(RetryInterval * (1 << entity.Attempts), MaxRetryInterval);
                 }
             }
@@ -857,7 +883,10 @@ namespace PoECoop.Sync
                 entity.Remote = true;
                 entity.Definition = definition;
                 if (entity.Object == null) _pending.Add(definition.Id);
-                ApplyDefinition(definition);
+                // A repeated definition of an entity that is still unresolved waits for its retry:
+                // attempting it here would search the whole scene at every manifest.
+                if (entity.Object == null && Time.unscaledTime < entity.NextAttempt) PerfStats.Count("entity.skipped");
+                else ApplyDefinition(definition);
             }
             if (fullFlag != 0)
             {

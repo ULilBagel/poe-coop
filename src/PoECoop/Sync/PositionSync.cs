@@ -53,6 +53,9 @@ namespace PoECoop.Sync
         private readonly Dictionary<Guid, Sent> _sent = new Dictionary<Guid, Sent>();
         private float _nextSend, _nextFullRefresh;
         private bool _forceFullRefresh = true;
+        private const float InactiveScanInterval = 30f;
+        private Mover[] _sceneMovers;
+        private float _nextInactiveScan;
         private int _skipped;
 
         // Guest: where each character should be.
@@ -158,6 +161,8 @@ namespace PoECoop.Sync
             bool full = _forceFullRefresh || now >= _nextFullRefresh;
             if (full)
             {
+                // A join or level change searches the scene again at once.
+                if (_forceFullRefresh) _nextInactiveScan = 0f;
                 _nextFullRefresh = now + FullRefreshInterval + (_forceFullRefresh ? FullRefreshPhase : 0f);
                 _forceFullRefresh = false;
             }
@@ -188,15 +193,23 @@ namespace PoECoop.Sync
             }
             if (full)
             {
-                // The game's Mover list omits objects disabled in the hierarchy.
-                long scanStarted = PerfStats.Begin();
-                Mover[] all = Resources.FindObjectsOfTypeAll<Mover>();
-                foreach (Mover mover in all)
+                // The game's Mover list omits objects disabled in the hierarchy. Searching the scene
+                // for them costs over ten milliseconds, so the result is kept and walked at every
+                // refresh; the search itself repeats every InactiveScanInterval. A mover created
+                // disabled in between is sampled once it is enabled or registered, as any other.
+                if (_sceneMovers == null || now >= _nextInactiveScan)
                 {
-                    if (mover != null && mover.gameObject.scene.IsValid()) AddSample(mover, true, ref message, ref count);
-                    if (count >= MaxMovers) break;
+                    long scanStarted = PerfStats.Begin();
+                    _sceneMovers = Resources.FindObjectsOfTypeAll<Mover>();
+                    _nextInactiveScan = now + InactiveScanInterval;
+                    PerfStats.End("position.scan", scanStarted);
                 }
-                PerfStats.End("position.scan", scanStarted);
+                Mover[] all = _sceneMovers;
+                for (int i = 0; i < all.Length && count < MaxMovers; i++)
+                {
+                    Mover mover = all[i];
+                    if (mover != null && mover.gameObject.scene.IsValid()) AddSample(mover, true, ref message, ref count);
+                }
             }
             PerfStats.Count("position.skipped", _skipped);
             if (message == null) return;
