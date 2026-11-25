@@ -17,6 +17,8 @@ namespace PoECoop.Sync
         private const float FullRefreshInterval = 3f;
         // Keeps the periodic refresh out of the frame the other streams use after a forced one.
         private const float FullRefreshPhase = 0.75f;
+        private const float TrackedScanInterval = 30f;
+        private float _nextTrackedScan;
         private const int MaxAnimationOwners = 4096;
         private const int MaxRecords = 16384;
         private const float MaxVitalValue = 1000000f;
@@ -159,8 +161,15 @@ namespace PoECoop.Sync
         {
             PruneTracked();
             Health[] healths = UnityEngine.Object.FindObjectsOfType<Health>();
+            int missed = 0;
             for (int i = 0; i < healths.Length; i++)
-                if (healths[i] != null && _trackedSet.Add(healths[i])) _tracked.Add(healths[i]);
+            {
+                if (healths[i] == null || !_trackedSet.Add(healths[i])) continue;
+                _tracked.Add(healths[i]);
+                missed++;
+            }
+            // Shows whether tracking at start ever misses an actor between searches.
+            if (missed > 0) PerfStats.Count("vitals.scan_found", missed);
         }
 
         public void Update(float now)
@@ -180,8 +189,18 @@ namespace PoECoop.Sync
             if (full)
             {
                 // A forced refresh (join, level load) is immediate; later ones keep their own phase.
-                _nextFullRefresh = now + FullRefreshInterval + (_nextFullRefresh <= 0f ? FullRefreshPhase : 0f);
-                ScanTracked();
+                bool forced = _nextFullRefresh <= 0f;
+                _nextFullRefresh = now + FullRefreshInterval + (forced ? FullRefreshPhase : 0f);
+                // Actors are tracked as they start, so the scene search only has to repair the set:
+                // at once after a join or level change, then every TrackedScanInterval.
+                if (forced || now >= _nextTrackedScan)
+                {
+                    _nextTrackedScan = now + TrackedScanInterval;
+                    long scanStarted = PerfStats.Begin();
+                    ScanTracked();
+                    PerfStats.End("vitals.scan", scanStarted);
+                }
+                else PruneTracked();
                 _seen.Clear();
             }
 
