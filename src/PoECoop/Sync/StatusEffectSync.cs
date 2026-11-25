@@ -748,7 +748,7 @@ namespace PoECoop.Sync
                 MixObject(ref hash, effect.PhraseOrigin);
                 Equippable equipment = effect.EquipmentOrigin;
                 MixObject(ref hash, equipment);
-                if (equipment != null) MixId(ref hash, GetId(equipment.gameObject));
+                if (equipment != null) MixId(ref hash, ItemId(equipment.gameObject));
                 Mix(ref hash, (int)effect.AbilityType);
                 Mix(ref hash, EffectFlags(effect));
                 Mix(ref hash, unchecked((int)effect.m_suspensionCount));
@@ -1053,7 +1053,7 @@ namespace PoECoop.Sync
                 kind = OriginKind.Equipment;
                 name = NormalizedName(equipment);
                 displayId = equipment.DisplayName.StringID;
-                objectId = GetId(equipment.gameObject);
+                objectId = ItemId(equipment.gameObject);
                 ordinal = FindComponentOrdinal(effect.Owner, equipment);
                 FindArray(equipment.StatusEffects, effect.Params, out parameterIndex);
                 if (parameterIndex >= 0) templateKind = TemplateKind.Origin;
@@ -2258,6 +2258,18 @@ namespace PoECoop.Sync
                 try { invocation[i].DynamicInvoke(args); }
                 catch (Exception ex) { Plugin.Log?.LogWarning("Status UI refresh failed: " + ex.Message); }
             }
+        }
+
+        /// <summary>
+        /// An item's own saved id, as a hint for finding the same item on the guest. Items are not
+        /// world entities: announced as one, an item whose id differs on the guest (an NPC's default
+        /// weapon gets a new id on every load) would be searched for there forever.
+        /// </summary>
+        private static Guid ItemId(GameObject go)
+        {
+            if (go == null) return Guid.Empty;
+            InstanceID instance = go.GetComponent<InstanceID>();
+            return instance != null ? instance.Guid : Guid.Empty;
         }
 
         private static Guid GetId(GameObject go)
